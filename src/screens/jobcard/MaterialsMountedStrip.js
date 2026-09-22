@@ -5,6 +5,7 @@ import Button from '../../theme/Button';
 import AppDialog from '../../theme/AppDialog';
 import { checkMaterial, setRemaining, ApiError } from '../../services/api';
 import { extractScannedRollId } from '../../utils/rollId';
+import { playScanSuccess, playScanError } from '../../utils/scanFeedback';
 
 const POOLS = [
   { key: 'facestock', label: 'Facestock' },
@@ -98,6 +99,7 @@ export default function MaterialsMountedStrip({
         // and fetch a different reel, and the thing they need for that is the
         // lot and machine, not an error message.
         if (res.code === 'wip') {
+          playScanError();
           const rid = res.rollId || shown;
           const where = `${res.lotNo || 'another job'}${res.machineName ? ` at ${res.machineName}` : ''}`;
           // A dialog rather than an inline note: a reel that is already running
@@ -123,6 +125,7 @@ export default function MaterialsMountedStrip({
         // past -- and OK clears the slot the same way. Only the office can
         // clear this one, so the message says who has to act.
         if (res.code === 'no-invoice') {
+          playScanError();
           const rid = res.rollId || shown;
           setDialog({
             pool,
@@ -138,6 +141,7 @@ export default function MaterialsMountedStrip({
           res.code === 'mismatch'
             ? `${res.rollId || shown} doesn't match this order's recipe.`
             : `${shown} — unknown reel.`;
+        playScanError();
         setNote(n => ({ ...n, [pool]: { tone: 'warn', title: msg } }));
         return;
       }
@@ -145,6 +149,7 @@ export default function MaterialsMountedStrip({
       // location, allotted }. Stored as-is, so `_id` is what every later
       // stockId-taking call (set-remaining, the .prn endpoints, the deckle's
       // materialsUsed trace) reads.
+      playScanSuccess();
       onMountedChange(pool, res.reel);
       setManualInput(m => ({ ...m, [pool]: '' }));
       // Resolved only once every pool the recipe needs has a reel; `pending`
@@ -155,6 +160,7 @@ export default function MaterialsMountedStrip({
       const v = res.variant;
       setVariant(v && !v.pending && v.isVariant ? v : null);
     } catch (err) {
+      playScanError();
       setNote(n => ({
         ...n,
         [pool]: { tone: 'warn', title: err instanceof ApiError ? err.message : 'Could not validate this reel.' },

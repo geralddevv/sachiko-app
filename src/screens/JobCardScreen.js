@@ -657,7 +657,7 @@ export default function JobCardScreen({ route, navigation }) {
       setDialog({
         tone: 'warning',
         title: 'Deckle still running',
-        message: `Deckle #${productionDone.length + 1} has a Start punch but no Stop, so it will be saved unfinished and won't reach Semi Finished Stock.`,
+        message: `Deckle #${productionDone.length} has a Start punch but no Stop, so it will be saved unfinished and won't reach Semi Finished Stock.`,
         buttons: [
           { label: 'Go back', variant: 'ghost', onPress: () => setDialog(null) },
           {
@@ -887,7 +887,7 @@ export default function JobCardScreen({ route, navigation }) {
             <JobSettingRow
               key={index}
               row={row}
-              index={index + 1}
+              index={index}
               materialsReady={canPunch}
               editing={editingJsIndex === index}
               onToggleEdit={() => setEditingJsIndex(i => (i === index ? null : index))}
@@ -953,7 +953,7 @@ export default function JobCardScreen({ route, navigation }) {
                 <ProductionLogRow
                   key={row.rowToken}
                   row={row}
-                  index={i + 1}
+                  index={i}
                   locked
                   editing={editingRowToken === row.rowToken}
                   onToggleEdit={() =>
@@ -964,7 +964,7 @@ export default function JobCardScreen({ route, navigation }) {
               ))}
               <ProductionLogRow
                 row={productionLive}
-                index={productionDone.length + 1}
+                index={productionDone.length}
                 locked={false}
                 onChange={updateLogRow}
                 onStart={startLogRow}

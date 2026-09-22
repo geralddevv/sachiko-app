@@ -1,6 +1,9 @@
 apply plugin: "com.android.application"
 apply plugin: "org.jetbrains.kotlin.android"
 apply plugin: "com.facebook.react"
+// Only MaterialCommunityIcons is used in these screens; the other 18 families
+// were ~2 MB of dead assets in every APK.
+project.ext.vectoricons = [ iconFontNames: [ "MaterialCommunityIcons.ttf" ] ]
 apply from: "../../node_modules/react-native-vector-icons/fonts.gradle"
 
 /**
@@ -58,7 +61,7 @@ react {
 /**
  * Set this to true to Run Proguard on Release builds to minify the Java bytecode.
  */
-def enableProguardInReleaseBuilds = false
+def enableProguardInReleaseBuilds = true
 
 /**
  * The preferred build flavor of JavaScriptCore (JSC)
@@ -103,6 +106,7 @@ android {
             // see https://reactnative.dev/docs/signed-apk-android.
             signingConfig signingConfigs.debug
             minifyEnabled enableProguardInReleaseBuilds
+            shrinkResources enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }

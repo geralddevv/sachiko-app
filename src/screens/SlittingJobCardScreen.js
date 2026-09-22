@@ -21,6 +21,7 @@ import {
 } from '../services/api';
 import { normalizeRollId } from '../utils/rollId';
 import { validateStartMtrs, validateStopMtrs, fmtMtrs } from '../utils/meters';
+import { playScanSuccess, playScanError } from '../utils/scanFeedback';
 
 // The SLITTING job card -- the step AFTER lamination. JobCardScreen turns raw
 // reels into Deckles (Semi Finished Goods); this one cuts one of those webs
@@ -176,6 +177,7 @@ export default function SlittingJobCardScreen({ route, navigation }) {
 
   // ── Scan ───────────────────────────────────────────────────────────────
   const armRow = (index, message) => {
+    playScanSuccess();
     setArmedIndex(index);
     setScanStatus({ tone: 'ok', message });
   };
@@ -189,11 +191,13 @@ export default function SlittingJobCardScreen({ route, navigation }) {
     const i = matchDeckle(rows, raw);
     if (i !== null) {
       if (rows[i].status === 'done') {
+        playScanError();
         setArmedIndex(null);
         setScanStatus({ tone: 'bad', message: `${rows[i].deckleId} has already been run on this card.` });
         return;
       }
       if (!curedNow(rows[i])) {
+        playScanError();
         setArmedIndex(null);
         const when = rows[i].curing?.curedAtLabel ? ` — ready at ${rows[i].curing.curedAtLabel}` : '';
         setScanStatus({
@@ -208,6 +212,7 @@ export default function SlittingJobCardScreen({ route, navigation }) {
 
     const target = rows.findIndex(r => r.status !== 'done');
     if (target === -1) {
+      playScanError();
       setArmedIndex(null);
       setScanStatus({ tone: 'bad', message: 'Every Deckle on this card has already been run.' });
       return;
@@ -226,6 +231,7 @@ export default function SlittingJobCardScreen({ route, navigation }) {
       const label = res.row?.deckleId || rows[target].deckleId;
       armRow(target, `${label} confirmed — punch Start when the machine runs.`);
     } catch (err) {
+      playScanError();
       setArmedIndex(null);
       setScanStatus({
         tone: 'bad',
