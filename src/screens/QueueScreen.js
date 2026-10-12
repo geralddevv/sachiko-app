@@ -1,12 +1,23 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { View, Text, StyleSheet, FlatList, RefreshControl, TouchableOpacity } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
 import { colors, radii, spacing, fontFamily } from '../theme/theme';
 import HeaderBar, { CountPill } from '../theme/HeaderBar';
+import { subscribeQueueChanges } from '../services/queueEvents';
 import { getQueue, logout, ApiError, isOfflineError } from '../services/api';
 import { useOffline, useOnReconnect } from '../services/connectivity';
-import { getPausedPendingIds } from '../storage/draftStorage';
+import { getDraftStates } from '../storage/draftStorage';
+import { normalizeRollId } from '../utils/rollId';
+import { LaminationViewDialog, SlittingViewDialog } from './queue/JobViewDialogs';
+import DeckleSelectDialog from './queue/DeckleSelectDialog';
+
+// "1:05 PM"
+const clockOf = ms => {
+  const d = new Date(ms);
+  const h = d.getHours();
+  return `${h % 12 || 12}:${String(d.getMinutes()).padStart(2, '0')} ${h >= 12 ? 'PM' : 'AM'}`;
+};
 
 // Rendered as the "Work Queue" panel inside HomeScreen's segmented toggle, so it
 // owns neither the nav-bar header nor logout (HomeScreen does) -- just its own
@@ -53,22 +64,39 @@ function PoolChip({ label, status }) {
   );
 }
 
-function JobCard({ job, paused, onStart }) {
+// `hold` is { at, reason } when the job is on hold (Pause), `started` that it
+// has been punched on this tablet and not ended.
+function JobCard({ job, hold, started, onStart, onView }) {
   return (
-    <View style={[styles.jobCard, { backgroundColor: ROW_TINT[job.materialStatus] || '#FFFFFF' }]}>
+    <View
+      style={[
+        styles.jobCard,
+        { backgroundColor: ROW_TINT[job.materialStatus] || '#FFFFFF' },
+        job.advance ? styles.jobCardAdvance : null,
+      ]}>
       <View style={styles.jobHeaderRow}>
         {/* The lot number alone -- it already reads as "SP | LOT | 0001", so a
             "Lot" prefix in front of it just says the same word twice. */}
         <View style={styles.jobHeaderLeft}>
           <Text style={styles.jobLot}>{job.lotNo}</Text>
-          {/* Paused: this operator started this job on this device and walked
-              away without ending it. Amber, with the same pause glyph the job
-              card's own button uses, so it reads as a state and not as another
-              material chip. */}
-          {paused ? (
+          {/* Paused: the operator put this job on hold with the job card's
+              Pause. Slate, with the same pause glyph the job card's own
+              button uses, so it reads as a state and not as another material
+              chip -- and the same colour the office's WIP tab shows it in. */}
+          {hold ? (
             <View style={styles.pausedBadge}>
-              <Icon name="pause-circle" size={13} color={colors.noticeText} />
+              <Icon name="pause-circle" size={13} color={colors.holdText} />
               <Text style={styles.pausedBadgeText}>Paused</Text>
+            </View>
+          ) : null}
+          {/* Advance: rolls set before their sales order was placed. The
+              server flags it (buildQueueRows' `advance`) until the order
+              comes in; the card keeps its material tint, the edge and this
+              badge carry the flag. */}
+          {job.advance ? (
+            <View style={styles.advanceBadge}>
+              <Icon name="calendar-clock" size={13} color="#FFFFFF" />
+              <Text style={styles.advanceBadgeText}>Advance</Text>
             </View>
           ) : null}
         </View>
@@ -107,22 +135,149 @@ function JobCard({ job, paused, onStart }) {
         <PoolChip label="Release" status={job.releaseStatus} />
       </View>
 
+      {hold ? (
+        <Text style={styles.holdLine}>
+          On hold since {clockOf(hold.at)}
+          {hold.reason ? ` · ${hold.reason}` : ''}
+        </Text>
+      ) : null}
+
       {/* runningElsewhere comes from the server's job-running claim: the same
           operator signed in on another device already has this job open, so it
-          reads as taken here rather than letting both punch the same job. */}
-      <TouchableOpacity
-        onPress={() => job.canStart && !job.runningElsewhere && onStart(job)}
-        disabled={!job.canStart || job.runningElsewhere}
-        style={[styles.startButton, (!job.canStart || job.runningElsewhere) && styles.startButtonDisabled]}>
-        <Text style={styles.startButtonText}>
-          {job.runningElsewhere
-            ? `In progress · ${job.runningOnLabel}`
-            : job.canStart
-            ? paused
-              ? '▶ Resume'
-              : '▶ Start'
-            : 'Awaiting material'}
+          reads as taken here rather than letting both punch the same job.
+          Resume is the tap that takes the job off hold -- the job card does it
+          as it opens (route param `resume`). View opens the layout read-only,
+          and stays available whatever the job's state. */}
+      <View style={styles.actionRow}>
+        <ViewButton onPress={() => onView(job)} label={job.lotNo} />
+        <TouchableOpacity
+          onPress={() => job.canStart && !job.runningElsewhere && onStart(job, !!hold)}
+          disabled={!job.canStart || job.runningElsewhere}
+          style={[
+            styles.startButton,
+            styles.actionGrow,
+            (!job.canStart || job.runningElsewhere) && styles.startButtonDisabled,
+          ]}>
+          <Text style={styles.startButtonText}>
+            {job.runningElsewhere
+              ? `In progress · ${job.runningOnLabel}`
+              : job.canStart
+              ? hold
+                ? '▶ Resume'
+                : started
+                ? '▶ Continue'
+                : '▶ Start'
+              : 'Awaiting material'}
+          </Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}
+
+// The read-only View button beside a card's Start. Outlined rather than filled
+// so the green Start stays the one action a card leads with.
+function ViewButton({ onPress, label }) {
+  return (
+    <TouchableOpacity
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`View job ${label}`}
+      style={styles.viewButton}>
+      <Icon name="eye-outline" size={15} color={colors.primary} />
+      <Text style={styles.viewButtonText}>View</Text>
+    </TouchableOpacity>
+  );
+}
+
+// Slitting cards cut to the same knife layout are bundled under one wrapper in
+// the queue. The server's `layoutSummary` already spells each card's layout as
+// "150 + 200 + 150" (with " × n" when several Deckles run it, and " | " between
+// distinct patterns), so that is the key -- minus the Deckle count, which says
+// how much of it a card has, not what it is. A card with no layout never
+// bundles. Groups keep the order of their first card.
+const layoutKeyOf = card => String(card.layoutSummary || '').replace(/\s*×\s*\d+/g, '').trim();
+
+const groupSlittingByLayout = cards => {
+  const groups = [];
+  const byKey = new Map();
+  cards.forEach(card => {
+    const key = layoutKeyOf(card) || `none-${card._id}`;
+    let group = byKey.get(key);
+    if (!group) {
+      group = { key, layout: layoutKeyOf(card), cards: [] };
+      byKey.set(key, group);
+      groups.push(group);
+    }
+    group.cards.push(card);
+  });
+  return groups;
+};
+
+// Which card of a group a scanned Deckle belongs to. A printed label's QR ends
+// with the Roll ID (the older format starts with it) and a typed entry is the
+// id itself, so matching against the group's own Deckle ids covers both; the
+// longest match wins. Same rule as the job card's own matchDeckle.
+const findScannedDeckle = (cards, raw) => {
+  const compact = normalizeRollId(raw);
+  if (!compact) {
+    return null;
+  }
+  let best = null;
+  cards.forEach(card =>
+    (card.deckles || []).forEach(d => {
+      const id = normalizeRollId(d.id);
+      if (id && (compact === id || compact.endsWith(id) || compact.startsWith(id))) {
+        if (!best || id.length > best.idLength) {
+          best = { card, done: d.done, idLength: id.length };
+        }
+      }
+    }),
+  );
+  return best;
+};
+
+// Several slitting cards cut to the same layout, as ONE tile -- the same shape
+// as a single SlittingCard, headed by the widths and how many jobs it holds.
+// Start opens a picker listing the group's jobs and the Deckles still to slit in
+// each (DeckleSelectDialog); the chosen Deckle opens its job with that Deckle
+// already confirmed. "Scan Deckle instead" keeps the original route -- scan the
+// reel in front of them and the scan says which job it is.
+function SlittingGroupCard({ group, onStart, note }) {
+  const cards = group.cards;
+  const sum = fn => cards.reduce((n, c) => n + (fn(c) || 0), 0);
+  const deckles = sum(c => c.deckleCount);
+  const done = sum(c => c.deckleDone);
+  const rollsToMake = sum(c => c.plannedRolls - c.producedRolls);
+  const curing = cards.filter(c => c.curing).length;
+  const running = cards.some(c => c.running);
+  return (
+    <View style={[styles.jobCard, curing === cards.length ? styles.slittingCardCuring : styles.slittingCard]}>
+      <View style={styles.jobHeaderRow}>
+        <Text style={styles.groupLayout} numberOfLines={2}>
+          {group.layout.split(/\s*\|\s*/).map(l => l.split(/\s*\+\s*/).join(' - ')).join('   |   ')}
         </Text>
+        <View style={styles.jobProductPill}>
+          <Text style={styles.jobProduct}>{cards.length} jobs</Text>
+        </View>
+      </View>
+      <Text style={styles.jobLine}>
+        Deckles: <Text style={styles.jobLineValue}>{deckles}</Text>, done:{' '}
+        <Text style={styles.jobLineValue}>{done}</Text>, rolls to make:{' '}
+        <Text style={styles.jobLineValue}>{rollsToMake}</Text>
+      </Text>
+      {curing > 0 ? (
+        <View style={styles.chipRow}>
+          <View style={[styles.chip, { backgroundColor: colors.noticeBg, borderColor: colors.noticeBorder }]}>
+            <Text style={[styles.chipText, { color: colors.noticeText }]}>
+              {curing === cards.length ? 'Curing' : `${curing} of ${cards.length} jobs curing`}
+            </Text>
+          </View>
+        </View>
+      ) : null}
+      {note ? <Text style={styles.groupNote}>{note}</Text> : null}
+      <TouchableOpacity onPress={() => onStart(group)} style={styles.startButton}>
+        <Text style={styles.startButtonText}>{running ? '▶ Resume' : '▶ Start · Select Job'}</Text>
       </TouchableOpacity>
     </View>
   );
@@ -138,27 +293,44 @@ function JobCard({ job, paused, onStart }) {
 //
 // The one gate worth showing here is curing: a Deckle can be opened but not
 // run until its adhesive has cured, 6 h after lamination.
-function SlittingCard({ card, onOpen }) {
+function SlittingCard({ card, onOpen, onView }) {
   const left = card.deckleLeft;
+  const rollsToMake = card.plannedRolls - card.producedRolls;
   return (
-    <View style={[styles.jobCard, card.curing ? styles.slittingCardCuring : styles.slittingCard]}>
+    <View
+      style={[
+        styles.jobCard,
+        card.curing ? styles.slittingCardCuring : styles.slittingCard,
+      ]}>
       <View style={styles.jobHeaderRow}>
+        {/* Lot leads, with the card's own slitting-job id as a quiet caption
+            beneath it -- the same primary/secondary identity block a lamination
+            tile leads with, rather than the id dangling on its own line under
+            the header. */}
         <View style={styles.jobHeaderLeft}>
-          <Text style={styles.jobLot} numberOfLines={1}>
-            {card.lotNo}
-          </Text>
+          <View style={styles.slittingIdentity}>
+            <Text style={styles.jobLot} numberOfLines={1}>
+              {card.lotNo}
+            </Text>
+            <Text style={styles.slittingCardId} numberOfLines={1}>
+              {card.slittingJobCardId}
+            </Text>
+          </View>
         </View>
         <View style={styles.jobProductPill}>
           <Text style={styles.jobProduct}>{card.productCode}</Text>
         </View>
       </View>
-      <Text style={styles.slittingCardId}>{card.slittingJobCardId}</Text>
       <Text style={styles.jobLine}>
         Deckles: <Text style={styles.jobLineValue}>{card.deckleCount}</Text>, done:{' '}
         <Text style={styles.jobLineValue}>{card.deckleDone}</Text>, rolls to make:{' '}
-        <Text style={styles.jobLineValue}>{card.plannedRolls - card.producedRolls}</Text>
+        <Text style={styles.jobLineValue}>{rollsToMake}</Text>
       </Text>
 
+      {/* Curing is the one gate on running this card, so it is the one thing
+          that gets a chip: notice amber while a Deckle is still curing. Once
+          every pending Deckle has cured the card is ready to run, which the
+          green card background says on its own -- no chip. */}
       {card.curing ? (
         <View style={styles.chipRow}>
           <View style={[styles.chip, { backgroundColor: colors.noticeBg, borderColor: colors.noticeBorder }]}>
@@ -172,24 +344,84 @@ function SlittingCard({ card, onOpen }) {
       {/* Open even while curing: the operator can read the layout and punch
           Job Setting: only the Deckle's own Start is gated, and the card
           itself says so. */}
-      <TouchableOpacity onPress={() => onOpen(card)} style={styles.startButton}>
-        <Text style={styles.startButtonText}>
-          {card.running ? '▶ Resume' : card.deckleDone > 0 ? `▶ Continue · ${left} left` : '▶ Start'}
-        </Text>
-      </TouchableOpacity>
+      <View style={styles.actionRow}>
+        <ViewButton onPress={() => onView(card)} label={card.lotNo} />
+        <TouchableOpacity onPress={() => onOpen(card)} style={[styles.startButton, styles.actionGrow]}>
+          <Text style={styles.startButtonText}>
+            {card.running ? '▶ Resume' : card.deckleDone > 0 ? `▶ Continue · ${left} left` : '▶ Start'}
+          </Text>
+        </TouchableOpacity>
+      </View>
     </View>
   );
 }
 
-export default function QueueScreen({ navigation, onLoggedOut }) {
+export default function QueueScreen({ navigation, onLoggedOut, scannedCode, onScanHandled }) {
   const [queue, setQueue] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
-  // pendingIds of the jobs this device has a paused draft for. Recomputed on
-  // every load, so coming back from a job that was just paused shows it, and
-  // ending a job (which clears its draft) drops the badge again.
-  const [pausedIds, setPausedIds] = useState(() => new Set());
+  // What this tablet's drafts say about each listed job -- on hold, or started
+  // here (storage/draftStorage.js's getDraftStates). Recomputed on every load,
+  // so coming back from a job that was just paused shows it, and ending a job
+  // (which clears its draft) drops the badge again.
+  const [draftStates, setDraftStates] = useState({});
+  // The row whose View dialog is open, tagged with its kind so the matching
+  // dialog shows it. null while no dialog is open.
+  const [viewing, setViewing] = useState(null);
   const offline = useOffline();
+  // The group whose Start opened the scanner, and what to tell the operator
+  // when the scan was not a Deckle of it.
+  const scanGroupRef = useRef(null);
+  const [groupNote, setGroupNote] = useState(null);
+
+  // The group whose Deckle picker is open, or null.
+  const [pickGroup, setPickGroup] = useState(null);
+
+  const startGroup = group => {
+    const live = group.cards.find(c => c.running);
+    if (live) {
+      navigation.navigate('SlittingJobCard', { cardId: live._id });
+      return;
+    }
+    setGroupNote(null);
+    setPickGroup(group);
+  };
+
+  // A Deckle picked in the dialog opens its job with that Deckle handed over to
+  // be confirmed -- the same hand-off a scan makes below.
+  const selectDeckle = ({ card, deckleId }) => {
+    setPickGroup(null);
+    navigation.navigate('SlittingJobCard', { cardId: card._id, armDeckle: deckleId });
+  };
+
+  const scanForGroup = () => {
+    const group = pickGroup;
+    setPickGroup(null);
+    if (!group) {
+      return;
+    }
+    scanGroupRef.current = group;
+    navigation.navigate('Scan', { returnTo: 'Home' });
+  };
+
+  // The scan comes back to Home as a param. Find its job inside the group that
+  // asked and open it with that Deckle handed over to be confirmed.
+  useEffect(() => {
+    const group = scanGroupRef.current;
+    if (!scannedCode || !group) {
+      return;
+    }
+    scanGroupRef.current = null;
+    onScanHandled && onScanHandled();
+    const hit = findScannedDeckle(group.cards, scannedCode);
+    if (!hit) {
+      setGroupNote({ key: group.key, message: "That Deckle isn't in this group — scan one of its Deckles." });
+    } else if (hit.done) {
+      setGroupNote({ key: group.key, message: 'That Deckle has already been slit.' });
+    } else {
+      navigation.navigate('SlittingJobCard', { cardId: hit.card._id, armDeckle: scannedCode });
+    }
+  }, [scannedCode, onScanHandled, navigation]);
 
   const load = useCallback(async () => {
     try {
@@ -200,7 +432,7 @@ export default function QueueScreen({ navigation, onLoggedOut }) {
       const listedIds = (data?.groups || []).flatMap(group =>
         (group.jobs || []).map(job => job._id),
       );
-      setPausedIds(await getPausedPendingIds(listedIds));
+      setDraftStates(await getDraftStates(listedIds));
       setError(null);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
@@ -220,6 +452,9 @@ export default function QueueScreen({ navigation, onLoggedOut }) {
   useFocusEffect(
     useCallback(() => {
       load();
+      // The server tells this tablet the moment a job is allocated to (or taken
+      // off) this operator, so the list updates itself -- nothing polls.
+      return subscribeQueueChanges(load);
     }, [load]),
   );
 
@@ -293,13 +528,28 @@ export default function QueueScreen({ navigation, onLoggedOut }) {
                   <Text style={styles.machineTitle}>
                     {machineName} · SLITTING · {cards.length === 1 ? '1 card' : `${cards.length} cards`}
                   </Text>
-                  {cards.map(sCard => (
-                    <SlittingCard
-                      key={sCard._id}
-                      card={sCard}
-                      onOpen={selected => navigation.navigate('SlittingJobCard', { cardId: selected._id })}
-                    />
-                  ))}
+                  {groupSlittingByLayout(cards).map(group => {
+                    if (group.cards.length > 1) {
+                      // Same layout on several cards: one tile for the lot.
+                      return (
+                        <SlittingGroupCard
+                          key={group.key}
+                          group={group}
+                          onStart={startGroup}
+                          note={groupNote?.key === group.key ? groupNote.message : null}
+                        />
+                      );
+                    }
+                    const sCard = group.cards[0];
+                    return (
+                      <SlittingCard
+                        key={sCard._id}
+                        card={sCard}
+                        onOpen={selected => navigation.navigate('SlittingJobCard', { cardId: selected._id })}
+                        onView={selected => setViewing({ kind: 'slitting', row: selected })}
+                      />
+                    );
+                  })}
                 </View>
               ))}
             </>
@@ -310,16 +560,44 @@ export default function QueueScreen({ navigation, onLoggedOut }) {
             <Text style={styles.machineTitle}>
               {group.machineName} · {group.machineType} · {group.locationName}
             </Text>
-            {group.jobs.map(job => (
-              <JobCard
-                key={job._id}
-                job={job}
-                paused={pausedIds.has(String(job._id))}
-                onStart={selected => navigation.navigate('JobCard', { pendingId: selected._id })}
-              />
-            ))}
+            {group.jobs.map(job => {
+              const local = draftStates?.[String(job._id)];
+              // On hold by this tablet's own Pause (which may not have reached
+              // the server yet) or by the server's (paused on another device).
+              const hold =
+                local?.paused ||
+                (job.paused?.since ? { at: new Date(job.paused.since).getTime(), reason: job.paused.reason } : null);
+              return (
+                <JobCard
+                  key={job._id}
+                  job={job}
+                  hold={hold}
+                  started={!!local?.started}
+                  onStart={(selected, resume) =>
+                    navigation.navigate('JobCard', { pendingId: selected._id, resume: resume || undefined })
+                  }
+                  onView={selected => setViewing({ kind: 'lamination', row: selected })}
+                />
+              );
+            })}
           </View>
         )}
+      />
+
+      <LaminationViewDialog
+        job={viewing?.kind === 'lamination' ? viewing.row : null}
+        onClose={() => setViewing(null)}
+      />
+      <SlittingViewDialog
+        row={viewing?.kind === 'slitting' ? viewing.row : null}
+        onClose={() => setViewing(null)}
+      />
+      <DeckleSelectDialog
+        visible={!!pickGroup}
+        group={pickGroup}
+        onSelect={selectDeckle}
+        onScan={scanForGroup}
+        onCancel={() => setPickGroup(null)}
       />
     </View>
   );
@@ -353,17 +631,34 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 4,
-    backgroundColor: colors.noticeBg,
+    backgroundColor: colors.holdBg,
     borderWidth: 1,
-    borderColor: colors.noticeBorder,
+    borderColor: colors.holdBorder,
     borderRadius: radii.pill,
     paddingHorizontal: spacing.sm,
     paddingVertical: 2,
   },
+  holdLine: { fontSize: 12, fontWeight: '600', color: colors.holdText, marginBottom: spacing.sm, fontFamily },
+  jobCardAdvance: { borderLeftWidth: 5, borderLeftColor: colors.advance },
+  advanceBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: colors.advance,
+    borderRadius: radii.pill,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 2,
+  },
+  advanceBadgeText: {
+    fontSize: 11,
+    fontWeight: '800',
+    color: '#FFFFFF',
+    fontFamily,
+  },
   pausedBadgeText: {
     fontSize: 11,
     fontWeight: '800',
-    color: colors.noticeText,
+    color: colors.holdText,
     fontFamily,
   },
   jobHeaderRow: {
@@ -403,12 +698,19 @@ const styles = StyleSheet.create({
   // only its absolute placement in the gutter sets it apart.
   jobWidthText: { fontSize: 16, fontWeight: '900', color: colors.primary, letterSpacing: 0.4, fontFamily },
   // Slitting cards carry no material-allotment tint (there are no pools to be
-  // short of -- the material IS the allocated Deckle), so they take the
-  // info-panel blue that sets them apart from the lamination tiles above, and
-  // the notice amber while a Deckle is still curing.
-  slittingCard: { backgroundColor: colors.infoPanelBg },
+  // short of -- the material IS the allocated Deckle). Curing is their one
+  // gate: notice amber while a Deckle is still curing, and the same match
+  // green a fully-allotted lamination tile takes once it has cured and is
+  // ready to run.
+  groupLayout: { flex: 1, fontSize: 18, fontWeight: '800', color: colors.primary, fontFamily },
+  groupNote: { fontSize: 12.5, fontWeight: '600', color: colors.dangerStrong, marginBottom: spacing.sm, fontFamily },
+  slittingCard: { backgroundColor: colors.rowMatchBg },
   slittingCardCuring: { backgroundColor: colors.noticeBg, borderColor: colors.noticeBorder },
-  slittingCardId: { fontSize: 11, fontWeight: '600', color: colors.textMuted, marginBottom: 3, fontFamily },
+  // The lot + id identity block in the header-left. Stacked (column) so the id
+  // sits as a caption directly under the lot; flexShrink lets a long lot
+  // ellipsise rather than shoving the product pill off the card.
+  slittingIdentity: { flexShrink: 1 },
+  slittingCardId: { fontSize: 11, fontWeight: '600', color: colors.textMuted, marginTop: 1, fontFamily },
   jobLine: { fontSize: 12.5, color: colors.textDark, marginBottom: 2, fontFamily },
   jobLineValue: { fontWeight: '700' },
   chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 4, marginBottom: spacing.sm },
@@ -425,6 +727,22 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     alignItems: 'center',
   },
+  // Card footer: View beside Start, Start taking the rest of the row.
+  actionRow: { flexDirection: 'row', alignItems: 'stretch', gap: spacing.sm },
+  actionGrow: { flex: 1 },
+  viewButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    borderWidth: 1.5,
+    borderColor: colors.primary,
+    borderRadius: radii.sm,
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: spacing.md,
+    paddingVertical: 8,
+  },
+  viewButtonText: { color: colors.primary, fontWeight: '700', fontSize: 12.5, fontFamily },
   startButtonDisabled: { backgroundColor: '#9CA3AF' },
   startButtonText: { color: '#FFFFFF', fontWeight: '700', fontSize: 12.5, fontFamily },
   errorBanner: {

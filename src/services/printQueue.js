@@ -1,6 +1,6 @@
 import { PrinterService } from './PrinterService';
 import { getDefaultPrinter } from '../storage/printersStorage';
-import { getDecklePrn, isOfflineError } from './api';
+import { getDecklePrn, getFinishedRollPrn, isOfflineError } from './api';
 import {
   getPrintQueue,
   addPrintJob,
@@ -143,11 +143,11 @@ class PrintQueueService {
 
   // Queue a Deckle's label and immediately try to send it. The caller does not
   // await the print -- punching Stop must not block on a printer.
-  async enqueue({ stockId, rollId, productCode }) {
+  async enqueue({ stockId, rollId, productCode, kind }) {
     if (!stockId) {
       return this.jobs;
     }
-    this.jobs = await addPrintJob({ stockId, rollId, productCode });
+    this.jobs = await addPrintJob({ stockId, rollId, productCode, kind });
     this._notify();
     // A brand-new label deserves a prompt attempt, not whatever long interval
     // the backoff had wound out to for the labels ahead of it.
@@ -252,12 +252,19 @@ class PrintQueueService {
       await this._connectWithRetry(printer);
       connected = true;
 
-      // Snapshot: this.jobs is replaced as entries succeed.
-      for (const job of [...this.jobs]) {
+      // Oldest first, re-reading the head each pass rather than walking a
+      // snapshot: a Stop can queue more labels while this drain is running
+      // (its enqueue() returns early because a flush is already going), and a
+      // snapshot would leave those for the 15 s retry timer.
+      while (this.jobs.length) {
+        const job = this.jobs[0];
         try {
           // Rebuilt server-side each attempt rather than cached at enqueue
           // time, so a label queued before an edit still prints current data.
-          const { tspl } = await getDecklePrn(job.stockId);
+          // `kind` picks the label: a produced Deckle, or a finished slit roll.
+          const { tspl } = job.kind === 'finished'
+            ? await getFinishedRollPrn(job.stockId)
+            : await getDecklePrn(job.stockId);
           await PrinterService.printLabel(tspl);
           this.jobs = await removePrintJob(job.id);
           // A label came out -- the printer is alive, so if the run still

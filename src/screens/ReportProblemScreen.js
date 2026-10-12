@@ -19,7 +19,10 @@ import HeaderBar from '../theme/HeaderBar';
 import Button from '../theme/Button';
 import AppDialog from '../theme/AppDialog';
 import MediaChoiceDialog from './maintenance/MediaChoiceDialog';
+import VoiceMessageField from './maintenance/VoiceMessageField';
+import { voiceRecordingSupported } from '../utils/voiceRecorder';
 import { getMaintenance, postMaintenance } from '../services/api';
+import { MAX_MAINTENANCE_VIDEO_SECONDS, trimVideoIfNeeded } from '../utils/videoTrim';
 
 const NOT_SURE = { _id: '', machineName: 'Not sure / not listed' };
 
@@ -40,6 +43,7 @@ export default function ReportProblemScreen({ navigation, route }) {
   const [description, setDescription] = useState('');
   const [photo, setPhoto] = useState(null); // { uri, name, type }
   const [video, setVideo] = useState(null); // { uri, name, type }
+  const [voice, setVoice] = useState(null); // { uri, name, type, durationMs } -- a recorded voice message
   const [pickerOpen, setPickerOpen] = useState(false);
   const [mediaChoiceOpen, setMediaChoiceOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -108,7 +112,7 @@ export default function ReportProblemScreen({ navigation, route }) {
       const result = await launchCamera({
         mediaType: 'video',
         videoQuality: 'high',
-        durationLimit: 60,
+        durationLimit: MAX_MAINTENANCE_VIDEO_SECONDS,
         saveToPhotos: false,
       });
       if (result.didCancel) {
@@ -166,7 +170,23 @@ export default function ReportProblemScreen({ navigation, route }) {
         (asset.type || '').startsWith('video') ||
         /\.(mp4|mov|m4v|3gp|mkv|avi|webm)$/i.test(asset.fileName || asset.uri || '');
       if (isVideo) {
-        setVideo({ uri: asset.uri, name: asset.fileName || 'video.mp4', type: asset.type || 'video/mp4' });
+        // Unlike launchCamera's durationLimit, the gallery picker doesn't cap
+        // clip length -- an already-recorded video can be any length, so it's
+        // trimmed down to the same limit after picking instead. A trim
+        // failure shouldn't lose the pick entirely, so it falls back to the
+        // untrimmed file with a warning rather than the "could not open
+        // gallery" error below.
+        let uri = asset.uri;
+        try {
+          uri = await trimVideoIfNeeded(asset.uri, asset.duration);
+        } catch (trimErr) {
+          setDialog({
+            tone: 'warning',
+            title: 'Could not trim video',
+            message: `This clip is longer than ${MAX_MAINTENANCE_VIDEO_SECONDS}s and couldn't be trimmed automatically. It will be attached at its full length.`,
+          });
+        }
+        setVideo({ uri, name: asset.fileName || 'video.mp4', type: asset.type || 'video/mp4' });
       } else {
         setPhoto({ uri: asset.uri, name: asset.fileName || 'photo.jpg', type: asset.type || 'image/jpeg' });
       }
@@ -185,17 +205,24 @@ export default function ReportProblemScreen({ navigation, route }) {
 
   const onSubmit = useCallback(async () => {
     const desc = description.trim();
-    if (!desc) {
+    // A voice message can stand in for the typed description.
+    if (!desc && !voice) {
       setDialog({
         tone: 'warning',
         title: 'Describe the problem',
-        message: 'Please describe the problem before submitting.',
+        message: 'Please describe the problem or record a voice message before submitting.',
       });
       return;
     }
     setSubmitting(true);
     try {
-      const res = await postMaintenance({ description: desc, machineId: machineId || undefined, photo, video });
+      const res = await postMaintenance({
+        description: desc,
+        machineId: machineId || undefined,
+        photo,
+        video,
+        audio: voice,
+      });
       setDialog({
         tone: 'success',
         title: 'Issue reported',
@@ -206,7 +233,7 @@ export default function ReportProblemScreen({ navigation, route }) {
       setDialog({ tone: 'error', title: 'Could not report', message: err.message || 'Please try again.' });
       setSubmitting(false);
     }
-  }, [description, machineId, photo, video, navigation]);
+  }, [description, machineId, photo, video, voice, navigation]);
 
   return (
     <View style={styles.container}>
@@ -267,6 +294,18 @@ export default function ReportProblemScreen({ navigation, route }) {
           <Icon name="chevron-down" size={20} color={colors.textMuted} />
         </TouchableOpacity>
 
+        {voiceRecordingSupported ? (
+          <>
+            <Text style={[styles.label, styles.labelSpaced]}>Voice message</Text>
+            <VoiceMessageField
+              value={voice}
+              onChange={setVoice}
+              disabled={submitting}
+              onError={(title, message) => setDialog({ tone: 'error', title, message })}
+            />
+          </>
+        ) : null}
+
         <Text style={[styles.label, styles.labelSpaced]}>What is the problem?</Text>
         <TextInput
           style={styles.textArea}
@@ -275,7 +314,11 @@ export default function ReportProblemScreen({ navigation, route }) {
           multiline
           maxLength={1000}
           numberOfLines={4}
-          placeholder="Describe the problem — what happened, what part, when it started..."
+          placeholder={
+            voice
+              ? 'Optional — your voice message is attached'
+              : 'Describe the problem — what happened, what part, when it started...'
+          }
           placeholderTextColor={colors.textMuted}
           textAlignVertical="top"
         />
@@ -284,7 +327,7 @@ export default function ReportProblemScreen({ navigation, route }) {
         <Button
           title={submitting ? 'Sending…' : 'Submit'}
           onPress={onSubmit}
-          disabled={submitting || !description.trim()}
+          disabled={submitting || (!description.trim() && !voice)}
           loading={submitting}
           style={styles.submit}
         />

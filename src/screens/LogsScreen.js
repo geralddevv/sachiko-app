@@ -178,6 +178,8 @@ export default function LogsScreen({ navigation, onLoggedOut }) {
           stockId: row.stockId,
           rollId: row.deckleId,
           productCode: row.productCode,
+          // 'finished' rows are slit rolls: their label comes from /finished/…/prn.
+          kind: row.kind === 'finished' ? 'finished' : 'deckle',
         });
         const { lastError } = await printQueue.flushToCompletion();
         // The details dialog is a Modal, so a toast rendered by this screen

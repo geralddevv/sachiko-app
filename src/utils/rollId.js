@@ -47,7 +47,7 @@ const FY = '\\d{2}-\\d{2}';
 //   ".../26-27/G0004/00001"  Deckle ids
 // Together these are its ROLL_ID_RE.
 const SEQ_TAIL = `\\/${FY}\\/\\d{3,}`;
-const DECKLE_TAIL = `\\/${FY}\\/[A-Z]+\\d{4,}\\/\\d{5,}`;
+const DECKLE_TAIL = `\\/${FY}\\/[A-Z]+\\d{4,}\\/\\d{4,}`;
 // An item code may carry hyphens inside it but never leads or ends with one.
 const ITEM_CODE = '[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?';
 

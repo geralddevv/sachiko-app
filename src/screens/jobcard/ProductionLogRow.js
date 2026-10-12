@@ -36,6 +36,7 @@ export default function ProductionLogRow({
   index,
   locked,
   editing,
+  offline,
   onToggleEdit,
   onChange,
   onStart,
@@ -71,7 +72,7 @@ export default function ProductionLogRow({
             on the Materials Mounted strip and can't differ between rows, so
             repeating them was noise. */}
         <View style={styles.headRow}>
-          <Text style={styles.rowTitle}>Deckle #{index}</Text>
+          <Text style={styles.rowTitle}>Deckle #{index + 1}</Text>
           <Text style={styles.doneMeters}>{row.meters} m</Text>
         </View>
         {/* Each punch shows the metre reading it was taken at, the same
@@ -102,15 +103,24 @@ export default function ProductionLogRow({
             {entry.reason ? ` — ${entry.reason}` : ''}
           </Text>
         ))}
+        {/* The row's Stop waits in the outbox (services/outbox.js) while
+            there is no connection, so "producing" can last a while: it says
+            so, rather than a spinner-ish line that never finishes. Edit stays
+            available then -- the Deckle ID is written in beside any edit when
+            the answer comes back. */}
         <View style={styles.doneFooter}>
           <Text style={row.producing ? styles.noteBusy : row.deckleId ? styles.noteOk : styles.notePending}>
             {row.producing
-              ? 'Moving to Semi Finished Stock…'
+              ? offline
+                ? 'Saved on this tablet — moves to Semi Finished Stock once the connection is back.'
+                : 'Moving to Semi Finished Stock…'
               : row.deckleId
               ? `✓ ${row.deckleId}${row.productCode ? ` · ${row.productCode}` : ''}`
+              : row.produceError
+              ? `Not moved (${String(row.produceError).replace(/\.+$/, '')}) — will be created on Save.`
               : 'Not moved yet — will be created on Save.'}
           </Text>
-          {onToggleEdit && !row.producing ? (
+          {onToggleEdit && (!row.producing || offline) ? (
             <TouchableOpacity onPress={onToggleEdit} style={styles.editButton}>
               <Text style={styles.editButtonText}>Edit</Text>
             </TouchableOpacity>
@@ -130,7 +140,7 @@ export default function ProductionLogRow({
           entry belongs behind a button and only what was actually recorded
           takes up room (the list under Deckle Meters). */}
       <View style={styles.headRow}>
-        <Text style={[styles.rowTitle, styles.rowTitleLive]}>Deckle #{index} · in progress</Text>
+        <Text style={[styles.rowTitle, styles.rowTitleLive]}>Deckle #{index + 1} · in progress</Text>
         <TouchableOpacity
           style={styles.jointButton}
           onPress={() => setJointOpen(true)}

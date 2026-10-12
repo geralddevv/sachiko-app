@@ -4,11 +4,29 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Stamps the operator's position onto the LOGIN entry in SACHIKO2's audit
          log. Best-effort only: a device that refuses or can't get a fix still
          signs in, so neither permission is required to use the app. -->
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <!-- Machine-overrun alarm: the notification itself (Android 13+ asks at
+         runtime), vibrating with it, and an alarm timed to the moment a running
+         Deckle goes overdue so it sounds even with the app closed. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <!-- Granted automatically on Android 13+ and not revocable: the alarm has to
+         fire on the dot. The service keeps it sounding with the app closed. -->
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Lets the alarm put the app on screen by itself on newer Android versions
+         that otherwise only show a banner (grant once per tablet: Settings >
+         Apps > Sachiko > Display over other apps). -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-feature android:name="android.hardware.camera" android:required="true" />
 
     <application
@@ -32,5 +50,11 @@
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
       </activity>
+      <receiver android:name=".OverrunAlarmReceiver" android:exported="false" />
+      <receiver android:name=".OverrunSilenceReceiver" android:exported="false" />
+      <service
+        android:name=".OverrunAlarmService"
+        android:exported="false"
+        android:foregroundServiceType="mediaPlayback" />
     </application>
 </manifest>

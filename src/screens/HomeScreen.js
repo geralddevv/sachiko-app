@@ -21,7 +21,7 @@ const SEGMENTS = [
   { key: 'logs', label: 'Logs' },
 ];
 
-export default function HomeScreen({ navigation, onLoggedOut }) {
+export default function HomeScreen({ navigation, route, onLoggedOut }) {
   const [tab, setTab] = useState('queue');
   // In-app themed dialog in place of RN's Alert.alert -- see theme/AppDialog.js.
   const [dialog, setDialog] = useState(null);
@@ -75,7 +75,12 @@ export default function HomeScreen({ navigation, onLoggedOut }) {
       </View>
       <View style={styles.body}>
         {tab === 'queue' ? (
-          <QueueScreen navigation={navigation} onLoggedOut={onLoggedOut} />
+          <QueueScreen
+            navigation={navigation}
+            onLoggedOut={onLoggedOut}
+            scannedCode={route?.params?.scannedCode}
+            onScanHandled={() => navigation.setParams({ scannedCode: undefined })}
+          />
         ) : (
           <LogsScreen navigation={navigation} onLoggedOut={onLoggedOut} />
         )}

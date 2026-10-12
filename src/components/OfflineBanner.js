@@ -4,6 +4,7 @@ import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors, radii, spacing, fontFamily } from '../theme/theme';
 import { useOffline, isOffline, retryNow } from '../services/connectivity';
+import { useOutboxPending } from '../services/outbox';
 
 // The app-wide "the server isn't there" bar. Mounted once beside the navigator
 // so it covers every screen, including the ones that have nowhere sensible of
@@ -15,6 +16,10 @@ import { useOffline, isOffline, retryNow } from '../services/connectivity';
 export default function OfflineBanner() {
   const insets = useSafeAreaInsets();
   const offline = useOffline();
+  // Punches waiting in the outbox (services/outbox.js). They are safe on the
+  // tablet and go by themselves on reconnect -- which is what the operator
+  // needs to hear, rather than that their work is being lost.
+  const waiting = useOutboxPending();
   const [checking, setChecking] = useState(false);
   // Kept mounted through the slide-out so the bar animates away instead of
   // vanishing the instant the server answers again.
@@ -68,7 +73,11 @@ export default function OfflineBanner() {
         <View style={styles.text}>
           <Text style={styles.title}>No connection to the server</Text>
           <Text style={styles.subtitle}>
-            {checking ? 'Checking…' : 'Your work is not being saved. Retrying…'}
+            {checking
+              ? 'Checking…'
+              : waiting
+              ? `${waiting === 1 ? '1 punch' : `${waiting} punches`} kept on this tablet — sent when it's back`
+              : 'Punches are kept on this tablet. Retrying…'}
           </Text>
         </View>
         <TouchableOpacity

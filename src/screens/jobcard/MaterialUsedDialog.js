@@ -116,7 +116,6 @@ export default function MaterialUsedDialog({ visible, layerAllotments, materialS
             )}
           </ScrollView>
           <View style={styles.buttons}>
-            <Button title="Skip" variant="danger" onPress={() => onSubmit({ facestock: [], adhesive: [], release: [] })} style={styles.buttonHalf} />
             <Button title="Continue" onPress={handleSubmit} style={styles.buttonHalf} />
           </View>
         </View>

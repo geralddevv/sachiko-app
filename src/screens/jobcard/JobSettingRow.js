@@ -46,7 +46,7 @@ export default function JobSettingRow({
   if (done && !editing) {
     return (
       <View style={[styles.row, styles.rowDone]}>
-        <Text style={styles.rowTitle}>Setting #{index}</Text>
+        <Text style={styles.rowTitle}>Setting #{index + 1}</Text>
         <View style={styles.donePunchRow}>
           <Text style={styles.donePunchLabel}>Start</Text>
           <Text style={styles.donePunchValue}>
@@ -73,7 +73,7 @@ export default function JobSettingRow({
   return (
     <View style={styles.row}>
       <View style={styles.headRow}>
-        <Text style={styles.rowTitle}>Setting #{index}</Text>
+        <Text style={styles.rowTitle}>Setting #{index + 1}</Text>
         {onRemove ? (
           <TouchableOpacity style={styles.removeButton} onPress={onRemove}>
             <Text style={styles.removeButtonText}>✕</Text>

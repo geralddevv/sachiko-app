@@ -152,6 +152,15 @@ async function requestMultipart(path, formData) {
 // read. It rides along purely so the server can stamp it onto the LOGIN audit
 // entry; nothing in the response depends on it, and a login with no geo at all
 // is still a perfectly valid login.
+// Who wants to know when the operator signs in or out. Registered by
+// services/overtimeReminder.js (which imports this file, so it can't be imported
+// from here): a sign-out must silence that operator's alarms, a sign-in starts
+// watching the new operator's jobs.
+const sessionHooks = {};
+export function setSessionHooks(hooks) {
+  Object.assign(sessionHooks, hooks);
+}
+
 export async function login({ operatorNick, location, password, geo }) {
   const data = await request('/login', {
     method: 'POST',
@@ -159,11 +168,13 @@ export async function login({ operatorNick, location, password, geo }) {
     body: { operatorNick, location, password, geo },
   });
   await setSession(data);
+  sessionHooks.onLogin?.();
   return data;
 }
 
 export async function logout() {
   await clearSession();
+  sessionHooks.onLogout?.();
 }
 
 export function getLocations() {
@@ -203,11 +214,51 @@ export function checkMaterial({ pendingId, pool, rollId, mounted }) {
   return request('/jobcard/material/check', { method: 'POST', body: { pendingId, pool, rollId, mounted } });
 }
 
+// ── Live punches ─────────────────────────────────────────────────────────────
+// Everything from here to logProduce is sent through services/outbox.js, never
+// called straight from a screen: the outbox keeps each punch until the server
+// has it, and adds `at` / `sentAt` (when it was tapped / sent) so the server
+// can date a punch that had to wait. Each passes its payload through whole so
+// those two reach the server.
+
 // Flags a mounted reel as actually being drawn on right now -- fired the
 // moment a row's Start is punched for whichever pool ids are already filled
 // in, not at scan time (see the server route's own comment on this timing).
-export function markInUse({ pendingId, pool, rollId }) {
-  return request('/jobcard/mark-in-use', { method: 'POST', body: { pendingId, pool, rollId } });
+// Payload: { pendingId, pool, rollId }.
+export function markInUse(payload) {
+  return request('/jobcard/mark-in-use', { method: 'POST', body: payload });
+}
+
+// Fired the moment a Job Setting row's Start / Stop is punched -- the WIP tab's
+// JOB SETTING phase, and the first punch is when the job counts as started
+// (SACHIKO2's PendingProduction.liveSetting / liveStartedAt). The Stop sends the
+// row's own start time, which is what the server matches it on.
+// Payloads: { pendingId, startTime, startMtrs } / { pendingId, startTime }.
+export function settingStart(payload) {
+  return request('/jobcard/setting/start', { method: 'POST', body: payload });
+}
+export function settingStop(payload) {
+  return request('/jobcard/setting/stop', { method: 'POST', body: payload });
+}
+
+// Fired the moment a Production Log row's Start is punched -- tells the server
+// which deckle is on the machine now and since when, which is what the WIP
+// tab's Live ETA counts from (SACHIKO2's PendingProduction.liveRun). Before
+// this the server heard nothing about a row until its Stop.
+// Payload: { pendingId, rowToken, startTime, startMtrs }.
+export function logStart(payload) {
+  return request('/jobcard/log/start', { method: 'POST', body: payload });
+}
+
+// Pause / Resume -- the job on hold and back (SACHIKO2's
+// PendingProduction.livePause). The office's WIP tab shows a paused job as ON
+// HOLD and stops its clock: no deckle filling, nothing turning overdue.
+// Payloads: { pendingId, reason } / { pendingId }.
+export function pauseJob(payload) {
+  return request('/jobcard/pause', { method: 'POST', body: payload });
+}
+export function resumeJob(payload) {
+  return request('/jobcard/resume', { method: 'POST', body: payload });
 }
 
 // Fired the moment a Production Log row's Stop is punched (with Meters
@@ -269,6 +320,23 @@ export function swapSlittingDeckle({ cardId, index, rollId }) {
   return request('/slitting/jobcard/row/swap-deckle', { method: 'POST', body: { cardId, index, rollId } });
 }
 
+// The operator's answer to the overtime reminder: why the Deckle ran late.
+// Optional -- an empty `remark` is the "Not now" dismissal, which is recorded
+// too. Sent through the outbox (services/outbox.js), so it survives being offline.
+//   lamination: `rowToken` names the run (the Start punch's token);
+//   slitting:   `deckleIndex` is the card's row number (1-based).
+export function postOvertimeRemark({ kind, id, rowToken, deckleIndex, remark }) {
+  return request('/overrun/remark', { method: 'POST', body: { kind, id, rowToken, deckleIndex, remark } });
+}
+
+// Re-orders the knife widths across one Deckle's web before it is started
+// (210+210+230 -> 210+230+210). `order` is the new left-to-right order given as
+// the CURRENT positions, e.g. [0, 2, 1]. Only the widths move; the slot letters
+// stay put. Resolves to { success, cuts } -- the row's cuts as now saved.
+export function reorderSlittingCuts({ cardId, index, order }) {
+  return request('/slitting/jobcard/row/reorder-cuts', { method: 'POST', body: { cardId, index, order } });
+}
+
 // Stamps the clock on one Deckle row. Deliberately separate from produce: a
 // run that is started and then abandoned leaves a start time and no stock
 // movement, which is exactly what happened on the floor.
@@ -293,6 +361,32 @@ export function editSlittingJoint({ cardId, index, joint, jointMtr }) {
   return request('/slitting/jobcard/row/edit', { method: 'POST', body: { cardId, index, joint, jointMtr } });
 }
 
+// ── Slitting live signals (the office Slitting WIP page) ───────────────────────
+// The slitting counterparts of claimJob / heartbeatJob / settingStart|Stop /
+// pauseJob / resumeJob above (SACHIKO2's SlittingJobCard.runningOn / liveSetting /
+// livePause). The deckle Start / Stop already carry their own live stamps
+// (startSlittingRow / produceSlittingRow), so these cover the running claim, the
+// Job Setting phase and the hold. Called directly (not via the outbox) like the
+// rest of the slitting flow.
+export function claimSlitting(cardId) {
+  return request('/slitting/jobcard/claim', { method: 'POST', body: { cardId } });
+}
+export function heartbeatSlitting(cardId) {
+  return request('/slitting/jobcard/heartbeat', { method: 'POST', body: { cardId } });
+}
+export function settingStartSlitting({ cardId, index, startTime, startMtrs }) {
+  return request('/slitting/jobcard/setting/start', { method: 'POST', body: { cardId, index, startTime, startMtrs } });
+}
+export function settingStopSlitting({ cardId, index }) {
+  return request('/slitting/jobcard/setting/stop', { method: 'POST', body: { cardId, index } });
+}
+export function pauseSlitting({ cardId, reason }) {
+  return request('/slitting/jobcard/pause', { method: 'POST', body: { cardId, reason } });
+}
+export function resumeSlitting({ cardId }) {
+  return request('/slitting/jobcard/resume', { method: 'POST', body: { cardId } });
+}
+
 // TSPL for one raw-material reel's label. `pool` is "facestock" | "adhesive" |
 // "release".
 export function getRollPrn(pool, stockId) {
@@ -302,6 +396,13 @@ export function getRollPrn(pool, stockId) {
 // TSPL for a produced Deckle's label.
 export function getDecklePrn(stockId) {
   return request(`/deckle/${encodeURIComponent(stockId)}/prn`);
+}
+
+// TSPL for one finished slit roll's label (FinishedStock id) -- the roll's own
+// width and a slightly smaller id font. Auto-printed when a Deckle's Stop is
+// punched, the same way a produced Deckle's label is.
+export function getFinishedRollPrn(stockId) {
+  return request(`/finished/${encodeURIComponent(stockId)}/prn`);
 }
 
 // ── Logs ─────────────────────────────────────────────────────────────────────
@@ -328,8 +429,9 @@ export function getMaintenance() {
 // Raise a ticket. `photo` and `video` (both optional) are captured files as
 // { uri, name, type }; a ticket can carry a photo and/or a video, matching the
 // web form and the server's multipart fields (photo/video). A description alone
-// is still a valid ticket, so both may be omitted.
-export function postMaintenance({ description, machineId, photo, video }) {
+// is still a valid ticket, so both may be omitted. `audio` is a voice message
+// that may stand in for the description.
+export function postMaintenance({ description, machineId, photo, video, audio }) {
   const form = new FormData();
   form.append('description', description);
   if (machineId) {
@@ -347,6 +449,15 @@ export function postMaintenance({ description, machineId, photo, video }) {
       uri: video.uri,
       name: video.name || 'video.mp4',
       type: video.type || 'video/mp4',
+    });
+  }
+  // A voice message (<= 30s, .m4a) for operators who can't type. The server
+  // trims to 30s again and stores it as the ticket's `audio` attachment.
+  if (audio?.uri) {
+    form.append('audio', {
+      uri: audio.uri,
+      name: audio.name || 'voice.m4a',
+      type: audio.type || 'audio/mp4',
     });
   }
   return requestMultipart('/maintenance', form);

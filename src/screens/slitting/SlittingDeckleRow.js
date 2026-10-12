@@ -1,18 +1,15 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet } from 'react-native';
 import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
 import { colors, radii, spacing, fontFamily } from '../../theme/theme';
 import { fmtMtrs } from '../../utils/meters';
+import SlittingJointDialog from './SlittingJointDialog';
 
-// The two defect kinds a Deckle web can carry, same pair the web slitting card
-// offers (slittingJobCardForm.ejs's jointOptionHtml) -- one list, not the
-// lamination card's two, because a Deckle IS a single web rather than a
-// facestock + release laminate.
-const JOINT_KINDS = [
-  { key: '', label: 'None' },
-  { key: 'Joint', label: 'Joint' },
-  { key: 'Wrinkle', label: 'Wrinkle' },
-];
+// The joint / wrinkle a Deckle web can carry is recorded behind a single "Joint"
+// button that opens SlittingJointDialog, and what's entered shows as a log line
+// underneath -- the slitting counterpart of the lamination card's own "Joint"
+// button + log (jobcard/ProductionLogRow.js + JointDialog.js). A Deckle IS one
+// web, so there is one defect to record, not the face + release pair.
 
 const formatPunchTime = date => {
   let hours = date.getHours();
@@ -80,6 +77,75 @@ export default function SlittingDeckleRow({
   onStop,
 }) {
   const state = rowState(row, armed);
+  const [jointOpen, setJointOpen] = useState(false);
+
+  // The joint / wrinkle thing, exactly as the coating card does it
+  // (jobcard/ProductionLogRow.js): a small "Joint" button in the header opens
+  // the dialog, and whatever has been entered SURVIVES as a log line underneath
+  // -- a dot, the kind and the metre, with a × to clear it. A Deckle is one web,
+  // so there is one entry, not the lamination card's face + release pair. The
+  // entry lives on the draft (joint / jointMtr), the same fields Start / Stop /
+  // Save already carry, so nothing downstream changes.
+  const jointButton = (
+    <TouchableOpacity
+      style={styles.jointButton}
+      onPress={() => setJointOpen(true)}
+      accessibilityRole="button"
+      accessibilityLabel="Record a joint or wrinkle">
+      <Text style={styles.jointButtonText}>Joint</Text>
+    </TouchableOpacity>
+  );
+  const clearJoint = () => {
+    onDraftChange('joint', '');
+    onDraftChange('jointMtr', '');
+  };
+  // The one entry, if any, in the shape the log renders -- read from the draft
+  // (live / editing) or the saved row (a finished row at rest).
+  const jointEntries = (joint, mtr) =>
+    (joint || (mtr != null && String(mtr).trim() !== '')
+      ? [{ joint, mtr: mtr != null && String(mtr).trim() !== '' ? fmtMtrs(mtr) : '' }]
+      : []);
+  const jointLog = (entries, removable) =>
+    (entries.length ? (
+      <View style={styles.jointLog}>
+        {entries.map((e, i) => (
+          <View key={i} style={styles.jointLogRow}>
+            <View style={styles.jointLogDot} />
+            <View style={styles.jointLogBody}>
+              <Text style={styles.jointLogText} numberOfLines={1}>
+                <Text style={styles.jointLogWeb}>{e.joint || '—'}</Text>
+                {e.mtr ? ` · ${e.mtr} m` : ''}
+              </Text>
+            </View>
+            {removable ? (
+              <TouchableOpacity
+                onPress={clearJoint}
+                accessibilityRole="button"
+                accessibilityLabel="Remove joint"
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                style={styles.jointLogRemove}>
+                <Text style={styles.jointLogRemoveText}>×</Text>
+              </TouchableOpacity>
+            ) : null}
+          </View>
+        ))}
+      </View>
+    ) : null);
+  const renderJointDialog = (bStart, bStop) => (
+    <SlittingJointDialog
+      visible={jointOpen}
+      joint={draft?.joint}
+      jointMtr={draft?.jointMtr}
+      startMtrs={bStart}
+      stopMtrs={bStop}
+      onCancel={() => setJointOpen(false)}
+      onSubmit={({ joint, jointMtr }) => {
+        onDraftChange('joint', joint);
+        onDraftChange('jointMtr', jointMtr);
+        setJointOpen(false);
+      }}
+    />
+  );
 
   if (state === 'done') {
     const producedIds = (row.cuts || []).map(c => c.rollId).filter(Boolean);
@@ -87,7 +153,10 @@ export default function SlittingDeckleRow({
       <View style={[styles.row, styles.rowDone]}>
         <View style={styles.headRow}>
           <Text style={styles.rowTitle}>Deckle #{index}</Text>
-          <Text style={styles.doneMeters}>{fmtMtrs(row.meter)} m</Text>
+          <View style={styles.headRight}>
+            <Text style={styles.doneMeters}>{fmtMtrs(row.meter)} m</Text>
+            {editing ? jointButton : null}
+          </View>
         </View>
         <Text style={styles.doneDeckleId} numberOfLines={1}>
           {row.deckleId}
@@ -110,41 +179,9 @@ export default function SlittingDeckleRow({
             correction -- its metres and its produced roll ids moved stock at
             Stop and are never reopened, here or anywhere else. Same rule as
             the web card's own pencil, and as the lamination card's. */}
-        {editing ? (
-          <View style={styles.jointEditor}>
-            <Text style={styles.fieldLabel}>Joint</Text>
-            <View style={styles.chipRow}>
-              {JOINT_KINDS.map(kind => {
-                const active = (draft.joint || '') === kind.key;
-                return (
-                  <TouchableOpacity
-                    key={kind.key || 'none'}
-                    style={[styles.chip, active && styles.chipActive]}
-                    onPress={() => onDraftChange('joint', kind.key)}
-                    accessibilityRole="radio"
-                    accessibilityState={{ selected: active }}>
-                    <Text style={[styles.chipText, active && styles.chipTextActive]}>{kind.label}</Text>
-                  </TouchableOpacity>
-                );
-              })}
-            </View>
-            {draft.joint ? (
-              <TextInput
-                style={[styles.input, styles.jointMtrInput]}
-                value={String(draft.jointMtr ?? '')}
-                onChangeText={v => onDraftChange('jointMtr', v)}
-                keyboardType="numeric"
-                placeholder="Counter reading the joint ran at"
-                placeholderTextColor={colors.textMuted}
-              />
-            ) : null}
-          </View>
-        ) : row.joint ? (
-          <Text style={styles.doneJoint}>
-            {row.joint}
-            {row.jointMtr != null && row.jointMtr !== '' ? ` · ${fmtMtrs(row.jointMtr)} m` : ''}
-          </Text>
-        ) : null}
+        {editing
+          ? jointLog(jointEntries(draft?.joint, draft?.jointMtr), true)
+          : jointLog(jointEntries(row.joint, row.jointMtr), false)}
         <View style={styles.doneFooter}>
           {/* The same confirmation the lamination card gives a produced
               Deckle, except this one names every finished roll the Stop
@@ -160,6 +197,7 @@ export default function SlittingDeckleRow({
             </TouchableOpacity>
           ) : null}
         </View>
+        {renderJointDialog(row.startMtrs, row.stopMtrs)}
       </View>
     );
   }
@@ -177,7 +215,9 @@ export default function SlittingDeckleRow({
   const short = row.reelMtrs != null && Number(row.plannedMeter) > Number(row.reelMtrs);
 
   const BADGE = {
-    pending: { icon: 'barcode-scan', text: 'Scan this Deckle to unlock Start', style: styles.badgePending },
+    // No 'pending' badge: a row waiting to be scanned shows no badge at all --
+    // the Scan Deckle card above already says what to do, so "Scan this Deckle
+    // to unlock Start" on every pending row was just noise.
     curing: {
       icon: 'timer-sand',
       text: `Still curing${row.curing?.curedAtLabel ? ` — ready at ${row.curing.curedAtLabel}` : ''}`,
@@ -197,16 +237,21 @@ export default function SlittingDeckleRow({
       ]}>
       <View style={styles.headRow}>
         <Text style={[styles.rowTitle, !armed && !running && styles.rowTitleMuted]}>Deckle #{index}</Text>
-        <Text style={styles.plannedMeters}>{fmtMtrs(row.plannedMeter)} m planned</Text>
+        <View style={styles.headRight}>
+          <Text style={styles.plannedMeters}>{fmtMtrs(row.plannedMeter)} m planned</Text>
+          {jointButton}
+        </View>
       </View>
       <Text style={styles.liveDeckleId} numberOfLines={1}>
         {row.deckleId}
       </Text>
 
-      <View style={[styles.badge, BADGE.style]}>
-        <Icon name={BADGE.icon} size={13} color={BADGE.style.color} />
-        <Text style={[styles.badgeText, { color: BADGE.style.color }]}>{BADGE.text}</Text>
-      </View>
+      {BADGE ? (
+        <View style={[styles.badge, BADGE.style]}>
+          <Icon name={BADGE.icon} size={13} color={BADGE.style.color} />
+          <Text style={[styles.badgeText, { color: BADGE.style.color }]}>{BADGE.text}</Text>
+        </View>
+      ) : null}
 
       {short ? (
         <Text style={styles.shortNote}>
@@ -276,33 +321,8 @@ export default function SlittingDeckleRow({
         <Text style={styles.meterValue}>{meter === null ? '—' : `${fmtMtrs(meter)} m`}</Text>
       </View>
 
-      <Text style={styles.fieldLabel}>Joint</Text>
-      <View style={styles.chipRow}>
-        {JOINT_KINDS.map(kind => {
-          const active = (draft.joint || '') === kind.key;
-          return (
-            <TouchableOpacity
-              key={kind.key || 'none'}
-              style={[styles.chip, active && styles.chipActive]}
-              onPress={() => onDraftChange('joint', kind.key)}
-              accessibilityRole="radio"
-              accessibilityState={{ selected: active }}>
-              <Text style={[styles.chipText, active && styles.chipTextActive]}>{kind.label}</Text>
-            </TouchableOpacity>
-          );
-        })}
-      </View>
-      {draft.joint ? (
-        <TextInput
-          style={[styles.input, styles.jointMtrInput]}
-          value={String(draft.jointMtr ?? '')}
-          onChangeText={v => onDraftChange('jointMtr', v)}
-          keyboardType="numeric"
-          placeholder="Counter reading the joint ran at"
-          placeholderTextColor={colors.textMuted}
-        />
-      ) : null}
-
+      {jointLog(jointEntries(draft.joint, draft.jointMtr), true)}
+      {renderJointDialog(running ? row.startMtrs ?? draft.startMtrs : draft.startMtrs, draft.stopMtrs)}
     </View>
   );
 }
@@ -370,7 +390,25 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
   },
   editButtonText: { color: colors.primary, fontSize: 11.5, fontWeight: '700', fontFamily },
-  jointEditor: { marginTop: spacing.sm },
+  // The Joint button + log, copied from the coating card (jobcard/
+  // ProductionLogRow.js) so the two read identically.
+  headRight: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  jointButton: {
+    borderWidth: 1,
+    borderColor: colors.warning,
+    borderRadius: radii.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 5,
+  },
+  jointButtonText: { color: colors.warningText, fontSize: 12, fontWeight: '700', fontFamily },
+  jointLog: { marginTop: spacing.sm, borderLeftWidth: 2, borderLeftColor: colors.noticeBorder, paddingLeft: spacing.sm },
+  jointLogRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, paddingVertical: 3 },
+  jointLogDot: { width: 6, height: 6, borderRadius: radii.pill, backgroundColor: colors.warning, flexShrink: 0 },
+  jointLogBody: { flex: 1 },
+  jointLogText: { fontSize: 12, color: colors.textDark, fontFamily },
+  jointLogWeb: { fontWeight: '700', color: colors.warningText },
+  jointLogRemove: { width: 28, height: 28, borderRadius: radii.pill, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.headerRowBg },
+  jointLogRemoveText: { fontSize: 17, lineHeight: 20, color: colors.textMuted, fontFamily },
   fieldsRow: { flexDirection: 'row', gap: spacing.sm, marginTop: spacing.sm },
   fieldCol: { flex: 1 },
   fieldLabel: { fontSize: 10.5, color: colors.textMuted, marginBottom: 2, marginTop: spacing.sm, fontFamily },
@@ -386,7 +424,6 @@ const styles = StyleSheet.create({
     fontFamily,
   },
   inputDisabled: { backgroundColor: '#F3F4F6', color: colors.textMuted },
-  jointMtrInput: { marginTop: spacing.xs },
   punchButton: {
     backgroundColor: colors.success,
     borderRadius: radii.sm,
@@ -414,16 +451,4 @@ const styles = StyleSheet.create({
   },
   meterLabel: { fontSize: 9.5, fontWeight: '700', letterSpacing: 0.5, color: colors.textMuted, fontFamily },
   meterValue: { fontSize: 16, fontWeight: '800', color: colors.primary, fontFamily },
-  chipRow: { flexDirection: 'row', gap: 6, flexWrap: 'wrap' },
-  chip: {
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: radii.pill,
-    paddingHorizontal: spacing.md,
-    paddingVertical: 5,
-    backgroundColor: '#FFFFFF',
-  },
-  chipActive: { backgroundColor: colors.primary, borderColor: colors.primary },
-  chipText: { fontSize: 12, fontWeight: '600', color: colors.primary, fontFamily },
-  chipTextActive: { color: '#FFFFFF' },
 });

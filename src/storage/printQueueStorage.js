@@ -22,42 +22,69 @@ export async function setPrintQueue(queue) {
   await setJson(STORAGE_KEYS.PRINT_QUEUE, queue);
 }
 
+// The queue is one stored array, and every change to it reads the array, edits
+// it and writes it back. AsyncStorage is asynchronous, so two changes running
+// at once both read the same array and whichever writes last wins: the other
+// job is silently dropped. A Stop that inwards several finished rolls queues
+// one label per roll with no await between them, so that is exactly how only
+// the last roll's label came out. Every write therefore waits for the one
+// before it to finish, so each reads what the previous one left.
+let queueWrites = Promise.resolve();
+function serializeQueueWrite(change) {
+  const run = queueWrites.then(change);
+  queueWrites = run.catch(() => {});
+  return run;
+}
+
 // Same Deckle twice is a no-op: Stop can be punched, fail to print, and be
 // retried, and the operator should still end up with one sticker.
-export async function addPrintJob({ stockId, rollId, productCode }) {
-  const queue = await getPrintQueue();
-  if (queue.some(job => job.stockId === stockId)) {
-    return queue;
-  }
-  const next = [
-    ...queue,
-    {
-      id: generateId('printjob'),
-      stockId,
-      rollId: rollId || '',
-      productCode: productCode || '',
-      createdAt: new Date().toISOString(),
-      attempts: 0,
-      lastError: null,
-    },
-  ];
-  await setPrintQueue(next);
-  return next;
+export function addPrintJob({ stockId, rollId, productCode, kind }) {
+  return serializeQueueWrite(async () => {
+    const queue = await getPrintQueue();
+    // `kind` ('deckle' | 'finished') picks which label the drain fetches. Dedupe
+    // on stockId + kind: a Deckle and a finished roll are different stock, but
+    // keying on both keeps it correct if ids ever overlap across collections.
+    const jobKind = kind || 'deckle';
+    if (queue.some(job => job.stockId === stockId && (job.kind || 'deckle') === jobKind)) {
+      return queue;
+    }
+    const next = [
+      ...queue,
+      {
+        id: generateId('printjob'),
+        stockId,
+        rollId: rollId || '',
+        productCode: productCode || '',
+        kind: jobKind,
+        createdAt: new Date().toISOString(),
+        attempts: 0,
+        lastError: null,
+      },
+    ];
+    await setPrintQueue(next);
+    return next;
+  });
 }
 
-export async function removePrintJob(id) {
-  const next = (await getPrintQueue()).filter(job => job.id !== id);
-  await setPrintQueue(next);
-  return next;
+export function removePrintJob(id) {
+  return serializeQueueWrite(async () => {
+    const next = (await getPrintQueue()).filter(job => job.id !== id);
+    await setPrintQueue(next);
+    return next;
+  });
 }
 
-export async function updatePrintJob(id, patch) {
-  const next = (await getPrintQueue()).map(job => (job.id === id ? { ...job, ...patch } : job));
-  await setPrintQueue(next);
-  return next;
+export function updatePrintJob(id, patch) {
+  return serializeQueueWrite(async () => {
+    const next = (await getPrintQueue()).map(job => (job.id === id ? { ...job, ...patch } : job));
+    await setPrintQueue(next);
+    return next;
+  });
 }
 
-export async function clearPrintQueue() {
-  await setPrintQueue([]);
-  return [];
+export function clearPrintQueue() {
+  return serializeQueueWrite(async () => {
+    await setPrintQueue([]);
+    return [];
+  });
 }

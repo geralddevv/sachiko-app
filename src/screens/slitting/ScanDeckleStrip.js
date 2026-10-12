@@ -12,7 +12,7 @@ import { colors, radii, spacing, fontFamily } from '../../theme/theme';
 // the card -- which knows its own allocated ids, and can fall back to the
 // server's own reel lookup for a swapped-in web -- can say where the id
 // starts. So the strip collects, the screen resolves.
-export default function ScanDeckleStrip({ status, busy, onSubmit, onScanRequest }) {
+export default function ScanDeckleStrip({ status, busy, confirmed, confirmedId, onSubmit, onScanRequest, onRescan }) {
   const [typed, setTyped] = useState('');
 
   const submit = () => {
@@ -23,6 +23,27 @@ export default function ScanDeckleStrip({ status, busy, onSubmit, onScanRequest 
     setTyped('');
     onSubmit(value);
   };
+
+  // Once a Deckle is confirmed the scan is DONE until it has been run -- so the
+  // input and Scan button give way to the confirmed id sitting in the field
+  // with a Change button on its right, exactly the way the lamination card's
+  // Materials Mounted strip shows a mounted reel (mountedRow/changeButton).
+  // Leaving the live scan box up beside the confirmation read as "it didn't
+  // take, scan again", which is the confusion this removes. Change hands back
+  // to the scan input (onRescan) so a different web can be run.
+  if (confirmed) {
+    return (
+      <View style={styles.mountedRow}>
+        <View style={styles.mountedText}>
+          <Text style={styles.mountedRollId}>{confirmedId}</Text>
+          <Text style={styles.mountedSub}>Confirmed — punch Start when the machine runs</Text>
+        </View>
+        <TouchableOpacity style={styles.changeButton} disabled={busy} onPress={onRescan}>
+          <Text style={styles.changeButtonText}>Change</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
 
   return (
     <View>
@@ -89,4 +110,19 @@ const styles = StyleSheet.create({
   status: { fontSize: 12, fontWeight: '600', color: colors.textMuted, marginTop: spacing.sm, fontFamily },
   statusOk: { color: '#15803D' },
   statusBad: { color: colors.dangerStrong },
+  // The confirmed state -- the id in the field with a Change button on the
+  // right. Same layout and the same styles as the lamination card's Materials
+  // Mounted strip (mountedRow/changeButton), so the two cards read alike.
+  mountedRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  mountedText: { flex: 1 },
+  mountedRollId: { fontWeight: '700', color: colors.textDark, fontFamily },
+  mountedSub: { fontSize: 11.5, color: colors.textMuted, fontFamily },
+  changeButton: {
+    borderWidth: 1,
+    borderColor: colors.dangerStrong,
+    borderRadius: radii.sm,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 6,
+  },
+  changeButtonText: { color: colors.dangerStrong, fontSize: 11.5, fontWeight: '700', fontFamily },
 });

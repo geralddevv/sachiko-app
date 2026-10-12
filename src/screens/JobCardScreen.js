@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator, Alert } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator, Alert, AppState } from 'react-native';
 import { KeyboardAwareScrollView } from 'react-native-keyboard-aware-scroll-view';
+import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
 import { colors, radii, spacing, fontFamily } from '../theme/theme';
 import Card from '../theme/Card';
 import Button from '../theme/Button';
@@ -10,16 +11,20 @@ import MaterialsMountedStrip from './jobcard/MaterialsMountedStrip';
 import JobSettingRow from './jobcard/JobSettingRow';
 import ProductionLogRow from './jobcard/ProductionLogRow';
 import MaterialUsedDialog from './jobcard/MaterialUsedDialog';
+import PauseDialog from './jobcard/PauseDialog';
+import { getJobCard, postJobCard, claimJob, heartbeatJob, ApiError, isOfflineError } from '../services/api';
+import { getDraft, saveDraft, clearDraft, draftStartedHere } from '../storage/draftStorage';
+import { outbox, useOutboxPending } from '../services/outbox';
+import { subscribeProduced } from '../services/liveSync';
 import {
-  getJobCard,
-  postJobCard,
-  logProduce,
-  markInUse,
-  claimJob,
-  heartbeatJob,
-  ApiError,
-} from '../services/api';
-import { getDraft, saveDraft, clearDraft } from '../storage/draftStorage';
+  startDeckle as startOvertimeTimer,
+  stopRun as stopOvertimeTimer,
+  pauseJob as pauseOvertimeTimers,
+  resumeJob as resumeOvertimeTimers,
+  clearJob as clearOvertimeTimers,
+  startBreak as startBreakTimer,
+} from '../services/overtimeReminder';
+import { useOffline, useOnReconnect } from '../services/connectivity';
 import { printQueue } from '../services/printQueue';
 import { newRowToken } from '../utils/rowToken';
 import {
@@ -53,6 +58,36 @@ const emptyLogRow = () => ({
 const emptyMounted = () => ({ facestock: null, adhesive: null, release: null });
 
 const todayIso = () => new Date().toISOString();
+
+// "1:05 PM" -- how the card shows when a hold began.
+const clockOf = ms => {
+  const d = new Date(ms);
+  const h = d.getHours();
+  return `${h % 12 || 12}:${String(d.getMinutes()).padStart(2, '0')} ${h >= 12 ? 'PM' : 'AM'}`;
+};
+
+// The body of a deckle's Stop -- POST /jobcard/log/produce -- from its row.
+// Built from the row alone, so a Stop that has to be sent again later (see
+// the recovery in `load`) carries exactly what the first one did.
+const producePayload = (pendingId, row) => ({
+  pendingId,
+  rowToken: row.rowToken,
+  fsRollId: row.fsRollId,
+  adRollId: row.adRollId,
+  rlRollId: row.rlRollId,
+  materialsUsed: row.materialsUsed,
+  startMtrs: row.startMtrs,
+  stopMtrs: row.stopMtrs,
+  meters: row.meters,
+  faceJoint: row.faceJoint,
+  faceJointReason: row.faceJointReason,
+  faceMtr: row.faceMtr,
+  releaseJoint: row.releaseJoint,
+  releaseJointReason: row.releaseJointReason,
+  releaseMtr: row.releaseMtr,
+  startTime: row.startTime,
+  endTime: row.endTime,
+});
 
 // Display names for the three raw-material pools, matching the Materials
 // Mounted strip's own slot labels (and LAYER_META on the server).
@@ -120,6 +155,14 @@ export default function JobCardScreen({ route, navigation }) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [pausing, setPausing] = useState(false);
+  // The job is on hold -- { at, reason } -- from this tablet's Pause, or the
+  // server's when the job was paused elsewhere. Kept in the draft. While it is
+  // set the office's WIP tab shows the job ON HOLD with its clock stopped.
+  const [paused, setPaused] = useState(null);
+  const [pauseDialogOpen, setPauseDialogOpen] = useState(false);
+  const offline = useOffline();
+  // This job's punches still waiting in the outbox (services/outbox.js).
+  const unsentPunches = useOutboxPending(pendingId);
   // Allocated Materials is reference the operator reads once, so it collapses
   // out of the way -- the actionable list is Materials Mounted above it.
   const [allocOpen, setAllocOpen] = useState(false);
@@ -152,6 +195,44 @@ export default function JobCardScreen({ route, navigation }) {
   const [pendingPrints, setPendingPrints] = useState([]);
   const [printQueueBusy, setPrintQueueBusy] = useState(false);
 
+  // Re-take the running claim without holding anything up. `claimHeld` is
+  // screen state, so leaving this job card -- Pause, an app restart, or just
+  // backing out to the queue -- drops it, and with it the heartbeat; nothing
+  // took it back, so a job still running on this device read "Started, last
+  // seen <the moment they left>" on the office's WIP tab for the rest of the
+  // run. A 409 means another device has the job now, which disables the
+  // punches the same way a lost heartbeat does. Any other failure (offline)
+  // is left for the next punch to retry -- the floor never waits on this.
+  const reclaim = useCallback(() => {
+    claimJob(pendingId)
+      .then(() => {
+        setClaimHeld(true);
+        setRunningOnOther(null);
+      })
+      .catch(err => {
+        if (err instanceof ApiError && err.status === 409) {
+          setRunningOnOther(err.body?.runningOnLabel || 'another device');
+        }
+      });
+  }, [pendingId]);
+
+  // Take the job off hold: the server hears it through the outbox (so it is
+  // kept, and dated when tapped, even offline) and the card stops showing the
+  // hold. Any punch while on hold does this first -- a Start or Stop means the
+  // machine is running again, whether or not Resume was tapped.
+  const resumeNow = useCallback(() => {
+    outbox.enqueue('resume', pendingId, { pendingId }).catch(() => {});
+    resumeOvertimeTimers(pendingId);
+    setPaused(null);
+  }, [pendingId]);
+  const pausedRef = useRef(null);
+  pausedRef.current = paused;
+  const resumeIfPaused = useCallback(() => {
+    if (pausedRef.current) {
+      resumeNow();
+    }
+  }, [resumeNow]);
+
   const load = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
@@ -160,18 +241,45 @@ export default function JobCardScreen({ route, navigation }) {
       setData(res);
       setRunningOnOther(res.runningElsewhere ? res.runningOnLabel || 'another device' : null);
       const draft = await getDraft(pendingId);
+      // Deckle Stops still waiting in the outbox from before -- their rows
+      // stay "producing" until the answer comes back (services/liveSync.js).
+      await outbox.ready();
+      const queuedStops = new Set(outbox.pendingFor(pendingId, 'produce').map(op => op.body?.rowToken));
+      // On hold: this tablet's own Pause (kept in the draft, and maybe not even
+      // sent yet), else the server's -- the job paused on another device.
+      const serverHold = res.paused?.since
+        ? { at: new Date(res.paused.since).getTime(), reason: res.paused.reason || '' }
+        : null;
+      const hold = draft?.paused?.at ? draft.paused : serverHold;
       if (draft) {
         setMounted(draft.mounted || emptyMounted());
         setJobSetting(draft.jobSetting?.length ? draft.jobSetting : [emptyJsRow()]);
         setProductionLive(draft.productionLive || emptyLogRow());
-        // `producing` is in-flight UI state, not a fact about the row. If the
-        // app was killed mid-instant-produce it would otherwise restore stuck
-        // on "Moving to Semi Finished Stock…" forever (and keep Edit hidden).
-        // A row that really did produce carries its deckleId; one that didn't
-        // is picked up by the final save on its rowToken.
-        setProductionDone((draft.productionDone || []).map(r => ({ ...r, producing: false })));
+        // `producing` is in-flight UI state, not a fact about the row: it is
+        // true only while that row's Stop is still in the outbox. Restored
+        // from the draft as-is it could sit on "Moving to Semi Finished
+        // Stock…" forever after an app kill.
+        const done = (draft.productionDone || []).map(r => ({ ...r, producing: queuedStops.has(r.rowToken) }));
+        // A stopped row with no Deckle, no Stop waiting and no refusal on it
+        // lost its Stop somewhere -- an app build that sent it only once, or
+        // an answer that never got written back. Sent again: the server
+        // matches the row's token, so it hands back the Deckle it already made
+        // or makes the one it never did, and either way the label prints now
+        // rather than at End Job.
+        done.forEach(r => {
+          if (!r.deckleId && !r.producing && !r.produceError && r.endTime && Number(r.meters) > 0) {
+            r.producing = true;
+            outbox.enqueue('produce', pendingId, producePayload(pendingId, r)).catch(() => {});
+          }
+        });
+        setProductionDone(done);
         setSubmissionToken(draft.submissionToken || res.submissionToken);
         setProductionStarted(!!draft.productionStarted);
+        // Only a job THIS device had already started -- opening one just to
+        // look still doesn't tie it up (see ensureClaim below).
+        if (draftStartedHere(draft)) {
+          reclaim();
+        }
       } else {
         setMounted(emptyMounted());
         setJobSetting([emptyJsRow()]);
@@ -180,16 +288,41 @@ export default function JobCardScreen({ route, navigation }) {
         setSubmissionToken(res.submissionToken);
         setProductionStarted(false);
       }
+      // Opened with the queue's Resume button: that tap is the resume.
+      // Opened any other way, a job on hold stays on hold, and says so.
+      if (hold && route.params?.resume) {
+        navigation.setParams({ resume: undefined });
+        resumeNow();
+        showToast('Job resumed — the office sees it running again.', 'success');
+      } else {
+        setPaused(hold);
+      }
     } catch (err) {
       setLoadError(err instanceof ApiError ? err.message : 'Could not load this job.');
     } finally {
       setLoading(false);
     }
-  }, [pendingId]);
+    // route.params.resume is read once, at open; it is cleared right after.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingId, reclaim, resumeNow]);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  // A deckle's Stop answered by the server in the background -- write its
+  // Deckle ID (or why it was refused) into this card's own copy of the row,
+  // which the autosave then keeps. liveSync has already queued its label.
+  useEffect(
+    () =>
+      subscribeProduced(({ pendingId: forJob, rowToken, patch }) => {
+        if (forJob !== String(pendingId)) {
+          return;
+        }
+        setProductionDone(rows => rows.map(r => (r.rowToken === rowToken ? { ...r, ...patch } : r)));
+      }),
+    [pendingId],
+  );
 
   useEffect(
     () =>
@@ -206,10 +339,34 @@ export default function JobCardScreen({ route, navigation }) {
       return;
     }
     const timer = setTimeout(() => {
-      saveDraft(pendingId, { submissionToken, mounted, jobSetting, productionLive, productionDone, productionStarted });
+      saveDraft(pendingId, {
+        submissionToken,
+        mounted,
+        jobSetting,
+        productionLive,
+        productionDone,
+        productionStarted,
+        paused,
+      });
     }, 400);
     return () => clearTimeout(timer);
-  }, [pendingId, submissionToken, mounted, jobSetting, productionLive, productionDone, productionStarted]);
+  }, [pendingId, submissionToken, mounted, jobSetting, productionLive, productionDone, productionStarted, paused]);
+
+  // Write the draft NOW, with `changes` over what is on screen -- for the
+  // moments that can't wait out the autosave's 400ms: a deckle's Stop (its
+  // row must be in the draft before the server's answer comes back to be
+  // written into it) and Pause (the screen is about to close).
+  const persistNow = changes =>
+    saveDraft(pendingId, {
+      submissionToken,
+      mounted,
+      jobSetting,
+      productionLive,
+      productionDone,
+      productionStarted,
+      paused,
+      ...changes,
+    });
 
   // The Production Log's live row always tracks whatever is currently
   // mounted (there is only ever one live row, so this is unambiguous, unlike
@@ -252,20 +409,27 @@ export default function JobCardScreen({ route, navigation }) {
   };
 
   // Fires the moment a row's Start is punched, for whichever pools are
-  // currently mounted -- see routes/api/operatorApi.js's mark-in-use. Fire
-  // and forget: a failure here never blocks the operator from continuing,
-  // same as the EJS's own markRowMaterialsInUse.
+  // currently mounted -- see routes/api/operatorApi.js's mark-in-use. Through
+  // the outbox like every live punch: never blocks the operator, and no
+  // longer lost when the network is down at that moment.
   const markMountedInUse = useCallback(() => {
     ['facestock', 'adhesive', 'release'].forEach(pool => {
       const reel = mounted[pool];
       if (!reel) return;
-      markInUse({ pendingId, pool, rollId: reel.rollId }).catch(() => {});
+      outbox.enqueue('mark-in-use', pendingId, { pendingId, pool, rollId: reel.rollId }).catch(() => {});
     });
   }, [mounted, pendingId]);
 
   // ── Running claim ──────────────────────────────────────────────────────
   // Taken lazily at the first Start punch rather than on open, so browsing a
   // job's recipe from a second device doesn't tie the job up.
+  //
+  // Only an actual refusal (409: the job is live on another device) stops the
+  // punch. Anything else -- no connection, the server erroring -- lets it go
+  // ahead: the punch is safe in the outbox, the claim is re-taken the moment
+  // the server is back (the reconnect handler below), and refusing would have
+  // told the operator the job was "running on another device" when all that
+  // was wrong was the Wi-Fi -- and then disabled every punch on the card.
   const ensureClaim = useCallback(async () => {
     if (claimHeld) {
       return true;
@@ -276,7 +440,10 @@ export default function JobCardScreen({ route, navigation }) {
       setRunningOnOther(null);
       return true;
     } catch (err) {
-      const label = err instanceof ApiError ? err.body?.runningOnLabel : null;
+      if (!(err instanceof ApiError && err.status === 409)) {
+        return true;
+      }
+      const label = err.body?.runningOnLabel;
       setRunningOnOther(label || 'another device');
       Alert.alert(
         'Already running',
@@ -289,12 +456,16 @@ export default function JobCardScreen({ route, navigation }) {
   // Keep the claim alive while this screen is open. Losing it (409) means the
   // claim went stale and another device took the job, so stop claiming to hold
   // it -- the Start punches disable themselves off runningOnOther.
+  //
+  // Android stops JS timers while the screen is off, which on a long deckle is
+  // most of the time -- so the beat is also sent the moment the app is back in
+  // front, rather than up to a minute later, and the office's "operator app
+  // online" catches up as soon as the operator picks the tablet up.
   useEffect(() => {
     if (!claimHeld) {
       return undefined;
     }
-    const everyMs = data?.heartbeatMs || 60000;
-    const timer = setInterval(async () => {
+    const beat = async () => {
       try {
         await heartbeatJob(pendingId);
       } catch (err) {
@@ -303,9 +474,30 @@ export default function JobCardScreen({ route, navigation }) {
           setRunningOnOther(err.body?.runningOnLabel || 'another device');
         }
       }
-    }, everyMs);
-    return () => clearInterval(timer);
+    };
+    const everyMs = data?.heartbeatMs || 60000;
+    const timer = setInterval(beat, everyMs);
+    const appStateSub = AppState.addEventListener('change', state => {
+      if (state === 'active') {
+        beat();
+      }
+    });
+    return () => {
+      clearInterval(timer);
+      appStateSub.remove();
+    };
   }, [claimHeld, pendingId, data?.heartbeatMs]);
+
+  // The server is back after a drop: a job under way here takes its claim
+  // straight back (the heartbeat may have lapsed while it was gone), rather
+  // than waiting for the next punch to notice.
+  const startedHereRef = useRef(false);
+  startedHereRef.current = draftStartedHere({ productionStarted, jobSetting, productionDone, productionLive });
+  useOnReconnect(() => {
+    if (startedHereRef.current) {
+      reclaim();
+    }
+  });
 
   // ── Material gate ──────────────────────────────────────────────────────
   // Every raw-material pool this order's recipe actually calls for, off
@@ -348,7 +540,13 @@ export default function JobCardScreen({ route, navigation }) {
     if (!(await ensureClaim())) {
       return;
     }
+    resumeIfPaused();
     markMountedInUse();
+    // Through the outbox, like every live punch: the office's WIP view hears
+    // of it as soon as the server can, and the punch never waits on that.
+    outbox
+      .enqueue('setting-start', pendingId, { pendingId, startTime: time, startMtrs: jobSetting[index]?.mtrs1 })
+      .catch(() => {});
     setJobSetting(rows =>
       rows.map((r, i) => (i === index ? { ...r, ...applyMounted(mounted), startTime: time } : r)),
     );
@@ -361,6 +559,10 @@ export default function JobCardScreen({ route, navigation }) {
       showToast(error);
       return;
     }
+    resumeIfPaused();
+    outbox
+      .enqueue('setting-stop', pendingId, { pendingId, startTime: jobSetting[index]?.startTime })
+      .catch(() => {});
     setJobSetting(rows => rows.map((r, i) => (i === index ? { ...r, stopTime: time } : r)));
   };
 
@@ -406,7 +608,38 @@ export default function JobCardScreen({ route, navigation }) {
     if (warning) {
       showToast(warning, 'warning');
     }
+    // A Production Log punch is the job running -- make sure this device is
+    // heartbeating it. In the background, unlike the Job Setting Start: this
+    // punch has always gone through offline, and must keep doing so.
+    if (!claimHeld) {
+      reclaim();
+    }
+    resumeIfPaused();
     markMountedInUse();
+    // Through the outbox: the office's ETA for this deckle counts from this
+    // punch, so it is kept until the server has it -- and dated when it was
+    // tapped, not when it finally got there.
+    outbox
+      .enqueue('log-start', pendingId, {
+        pendingId,
+        rowToken: productionLive.rowToken,
+        startTime: time,
+        startMtrs: productionLive.startMtrs,
+      })
+      .catch(() => {});
+    // The overtime reminder times this Deckle from this punch, on the tablet --
+    // its length over the machine's speed, so it needs no connection.
+    startOvertimeTimer({
+      kind: 'lamination',
+      jobId: pendingId,
+      runKey: productionLive.rowToken,
+      deckleNo: (Number(data?.prefill?.producedRolls) || 0) + productionDone.length + 1,
+      label: data?.timing?.lotNo,
+      machineName: data?.timing?.machineName,
+      mtrs: data?.timing?.deckleMtrs,
+      speedMpm: data?.timing?.speedMpm,
+      at: Date.now(),
+    });
     setProductionLive(row => ({ ...row, startTime: time }));
   };
 
@@ -422,70 +655,31 @@ export default function JobCardScreen({ route, navigation }) {
   };
 
   // Punches Stop, freezes the live row into the done list, opens a fresh live
-  // row, and fires the instant-produce -- ported from jobCardForm.ejs's
+  // row, and sends the instant-produce -- ported from jobCardForm.ejs's
   // commitLogRowStop. Deliberately reads `productionLive` from the current
   // render rather than mutating inside a setState updater: an updater must be
   // a pure function of previous state, and queueing another component's
   // setState from inside one double-fires under React's dev double-invoke.
+  //
+  // The produce goes through the outbox, and its answer comes back through
+  // services/liveSync.js -- which queues the Deckle's label and writes its
+  // Deckle ID onto the row (subscribeProduced above) -- whenever the server
+  // takes it: now, or once the connection is back. The draft is written
+  // straight away too, so the row is in it when that answer arrives even if
+  // the app has been closed in between (and if it somehow isn't, reopening
+  // the card sends the Stop again -- see the recovery in `load`). A Stop the
+  // server refuses leaves the row for the final save to make, as before
+  // (matched on its rowToken).
   const commitLogRowStop = time => {
+    resumeIfPaused();
     const stopped = { ...productionLive, endTime: time, producing: true };
-    setProductionDone(rows => [...rows, stopped]);
-    setProductionLive(emptyLogRow());
-
-    // Fires in the background -- a lost/failed response falls back to the
-    // final save, matched back by rowToken. See services/api.js's
-    // logProduce and the server's own comment on this same flow.
-    logProduce({
-      pendingId,
-      rowToken: stopped.rowToken,
-      fsRollId: stopped.fsRollId,
-      adRollId: stopped.adRollId,
-      rlRollId: stopped.rlRollId,
-      materialsUsed: stopped.materialsUsed,
-      startMtrs: stopped.startMtrs,
-      stopMtrs: stopped.stopMtrs,
-      meters: stopped.meters,
-      faceJoint: stopped.faceJoint,
-      faceJointReason: stopped.faceJointReason,
-      faceMtr: stopped.faceMtr,
-      releaseJoint: stopped.releaseJoint,
-      releaseJointReason: stopped.releaseJointReason,
-      releaseMtr: stopped.releaseMtr,
-      startTime: stopped.startTime,
-      endTime: stopped.endTime,
-    })
-      .then(res => {
-        // The Deckle now physically exists, so its sticker is due. Queued
-        // rather than printed inline: enqueue() fires the print itself and a
-        // dead printer must not block the punch or throw an alert into the
-        // middle of a run -- the label waits in the queue instead. See
-        // services/printQueue.js.
-        printQueue.enqueue({
-          stockId: res.deckleStockId,
-          rollId: res.deckleId,
-          productCode: res.productCode,
-        });
-        setProductionDone(rows =>
-          rows.map(r =>
-            r.rowToken === stopped.rowToken
-              ? {
-                  ...r,
-                  producing: false,
-                  deckleId: res.deckleId,
-                  deckleStockId: res.deckleStockId,
-                  productCode: res.productCode,
-                }
-              : r,
-          ),
-        );
-      })
-      .catch(() => {
-        // Left with no deckleId -- the final save's produceDecklesFromLog
-        // makes it then, matching the "will be created on Save" note.
-        setProductionDone(rows =>
-          rows.map(r => (r.rowToken === stopped.rowToken ? { ...r, producing: false } : r)),
-        );
-      });
+    const nextDone = [...productionDone, stopped];
+    const nextLive = emptyLogRow();
+    outbox.enqueue('produce', pendingId, producePayload(pendingId, stopped)).catch(() => {});
+    stopOvertimeTimer('lamination', pendingId, productionLive.rowToken);
+    setProductionDone(nextDone);
+    setProductionLive(nextLive);
+    persistNow({ productionDone: nextDone, productionLive: nextLive, paused: null }).catch(() => {});
   };
 
   const stopLogRow = time => {
@@ -567,6 +761,11 @@ export default function JobCardScreen({ route, navigation }) {
   const submitJobCard = async materialUsage => {
     setSaving(true);
     try {
+      // This job's live punches still in the outbox go first, so the server
+      // has every deckle the card is about to file. Bounded: one that can't go
+      // (the server erroring on it) mustn't hold End Job up -- the save files
+      // that row itself, matched on its rowToken.
+      await outbox.flushFor(pendingId, 15000);
       const prefill = data.prefill;
       const logRows = buildLogRowsForSave();
       const payload = {
@@ -624,7 +823,7 @@ export default function JobCardScreen({ route, navigation }) {
       };
 
       const outcome = await postJobCard(payload);
-      await clearDraft(pendingId);
+      await finishedHere();
       Alert.alert('Saved', outcome.message || 'Production entry saved successfully!', [
         { text: 'OK', onPress: () => navigation.navigate('Home') },
       ]);
@@ -632,14 +831,36 @@ export default function JobCardScreen({ route, navigation }) {
       if (err instanceof ApiError && (err.body?.status === 'gate-failed' || err.body?.status === 'wip-clash')) {
         Alert.alert('Cannot save', err.body.message);
       } else if (err instanceof ApiError && err.body?.status === 'duplicate') {
-        await clearDraft(pendingId);
+        await finishedHere();
         navigation.navigate('Home');
+      } else if (isOfflineError(err)) {
+        // The one save that can't wait in the outbox -- the server has to
+        // check the materials and file the card there and then. Nothing is
+        // lost by it failing: say so, plainly.
+        setDialog({
+          tone: 'warning',
+          title: 'No connection to the server',
+          message:
+            'The job was not saved yet, but nothing is lost — every punch and reading is kept on this tablet. Tap End Job again once the connection is back.',
+          buttons: [{ label: 'OK', onPress: () => setDialog(null) }],
+        });
       } else {
         Alert.alert('Save failed', err instanceof ApiError ? err.message : 'Something went wrong.');
       }
     } finally {
       setSaving(false);
     }
+  };
+
+  // The card is filed: forget its draft, and the live punches still waiting
+  // for it -- sent now, they'd only put the finished job back on the WIP tab
+  // (a Start, a Pause). A deckle's Stop stays: its answer still prints the
+  // label of a Deckle the save has just made.
+  const finishedHere = async () => {
+    await clearDraft(pendingId);
+    // (A remark on why a Deckle ran late stays too -- it is still owed to the office.)
+    await outbox.dropForJob(pendingId, { keepKinds: ['produce', 'overtime-remark'] });
+    clearOvertimeTimers(pendingId);
   };
 
   // "End Job" -- the job is finished, so go on to Material Used and the final
@@ -657,7 +878,7 @@ export default function JobCardScreen({ route, navigation }) {
       setDialog({
         tone: 'warning',
         title: 'Deckle still running',
-        message: `Deckle #${productionDone.length} has a Start punch but no Stop, so it will be saved unfinished and won't reach Semi Finished Stock.`,
+        message: `Deckle #${productionDone.length + 1} has a Start punch but no Stop, so it will be saved unfinished and won't reach Semi Finished Stock.`,
         buttons: [
           { label: 'Go back', variant: 'ghost', onPress: () => setDialog(null) },
           {
@@ -676,47 +897,54 @@ export default function JobCardScreen({ route, navigation }) {
   };
 
   // "Pause" -- the operator is stepping away (break, shift change, a reel to
-  // fetch), not finishing. Nothing is sent to the server: the card is left
-  // unsaved and the job stays in the Work Queue exactly as it is, with every
-  // punch, meter reading and mounted reel kept in the draft. Reopening the job
-  // restores it and carries on. Deckles already punched out are unaffected --
-  // each one was inwarded to Semi Finished Stock at its own Stop.
+  // fetch), not finishing. The card is left unsaved and the job stays in the
+  // Work Queue exactly as it is, with every punch, meter reading and mounted
+  // reel kept in the draft; reopening it with Resume carries on from here.
+  // Deckles already punched out are unaffected -- each one was inwarded to
+  // Semi Finished Stock at its own Stop.
+  //
+  // The server is told too (POST /jobcard/pause, through the outbox so it is
+  // kept and dated from the tap even with no connection): the office's WIP tab
+  // then shows the job ON HOLD with the reason picked here, and holds its
+  // clock -- the deckle on the machine stops filling, nothing turns overdue,
+  // and the time on hold is never counted as a delay.
   //
   // The draft is written here directly rather than relying on the 400ms
   // autosave debounce, so nothing can be lost between the tap and the screen
   // going away. The running claim is deliberately left alone: it expires by
   // itself once the heartbeat stops, which is what frees the job for another
   // device if this operator never comes back to it.
-  const handlePause = () => {
-    setDialog({
-      tone: 'info',
-      title: 'Pause this job?',
-      message:
-        'Everything punched so far is kept and the job stays in your Work Queue. Open it again to carry on from here.',
-      buttons: [
-        { label: 'Cancel', variant: 'ghost', onPress: () => setDialog(null) },
-        {
-          label: 'Pause',
-          onPress: async () => {
-            setDialog(null);
-            setPausing(true);
-            try {
-              await saveDraft(pendingId, {
-                submissionToken,
-                mounted,
-                jobSetting,
-                productionLive,
-                productionDone,
-                productionStarted,
-              });
-            } finally {
-              setPausing(false);
-            }
-            navigation.navigate('Home');
-          },
-        },
-      ],
-    });
+  const handlePause = () => setPauseDialogOpen(true);
+  const handleResumeTap = () => {
+    resumeNow();
+    showToast('Job resumed — the office sees it running again.', 'success');
+  };
+  const confirmPause = async reason => {
+    setPauseDialogOpen(false);
+    setPausing(true);
+    const hold = { at: Date.now(), reason };
+    try {
+      await Promise.all([
+        outbox.enqueue('pause', pendingId, { pendingId, reason }),
+        persistNow({ paused: hold }),
+        pauseOvertimeTimers(pendingId, hold.at),
+        // Tea / Lunch Break: the "break is over" alarm is timed from this tap.
+        startBreakTimer({
+          jobId: pendingId,
+          reason,
+          label: data?.timing?.lotNo,
+          machineName: data?.timing?.machineName,
+          at: hold.at,
+        }),
+      ]);
+    } catch (err) {
+      // Both are local writes; the hold still shows on the queue from the
+      // state below, and the server hears it once it is stored.
+    } finally {
+      setPausing(false);
+    }
+    setPaused(hold);
+    navigation.navigate('Home');
   };
 
   if (loading) {
@@ -778,6 +1006,50 @@ export default function JobCardScreen({ route, navigation }) {
         {/* The lot number alone -- it already reads as "SP | LOT | 000001", so a
             "Lot" prefix repeats itself, and the job card id it used to sit beside
             is an office reference the operator never needs to quote. */}
+        {/* Rolls on this job were set before their sales order was placed --
+            the same ADVANCE flag the queue card carries. */}
+        {prefill.advance ? (
+          <View style={styles.advanceBanner}>
+            <Text style={styles.advanceBannerText}>
+              ADVANCE — {prefill.advance.rolls} roll(s) on this job were set before their sales order. Run it as normal.
+            </Text>
+          </View>
+        ) : null}
+        {/* On hold, and opened without the queue's Resume -- say so up top,
+            with the way out right there. Any Start or Stop punched below
+            resumes it too. */}
+        {paused ? (
+          <View style={styles.holdBanner}>
+            <Icon name="pause-circle" size={22} color={colors.holdText} />
+            <View style={styles.holdText}>
+              <Text style={styles.holdTitle}>
+                On hold since {clockOf(paused.at)}
+                {paused.reason ? ` · ${paused.reason}` : ''}
+              </Text>
+              <Text style={styles.holdSub}>The office sees this job paused until you resume it.</Text>
+            </View>
+            <TouchableOpacity
+              onPress={handleResumeTap}
+              accessibilityRole="button"
+              accessibilityLabel="Resume this job"
+              style={styles.holdButton}>
+              <Text style={styles.holdButtonText}>Resume</Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
+        {/* Punches made with no connection, waiting on this tablet. The
+            app-wide offline bar says the server is gone; this says what that
+            means for THIS job -- nothing lost, it just hasn't reached the
+            office yet. */}
+        {offline && unsentPunches ? (
+          <View style={styles.syncNotice}>
+            <Icon name="cloud-upload-outline" size={18} color={colors.noticeText} />
+            <Text style={styles.syncNoticeText}>
+              {unsentPunches === 1 ? '1 punch' : `${unsentPunches} punches`} saved on this tablet — the office will
+              see {unsentPunches === 1 ? 'it' : 'them'} once the connection is back.
+            </Text>
+          </View>
+        ) : null}
         <Card title={prefill.lotNo}>
           <View style={styles.midRow}>
             <MidItem label="LS Stock" value={prefill.productCode} />
@@ -956,6 +1228,7 @@ export default function JobCardScreen({ route, navigation }) {
                   index={i}
                   locked
                   editing={editingRowToken === row.rowToken}
+                  offline={offline}
                   onToggleEdit={() =>
                     setEditingRowToken(t => (t === row.rowToken ? null : row.rowToken))
                   }
@@ -992,11 +1265,11 @@ export default function JobCardScreen({ route, navigation }) {
                 navy half and Pause is the hollow one beside it. */}
             <View style={styles.jobActionsRow}>
               <Button
-                title="Pause"
-                icon="pause"
-                variant="outline"
+                title={paused ? 'Resume' : 'Pause'}
+                icon={paused ? 'play' : 'pause'}
+                variant={paused ? 'hold' : 'outline'}
                 size="sm"
-                onPress={handlePause}
+                onPress={paused ? handleResumeTap : handlePause}
                 loading={pausing}
                 disabled={saving}
                 style={styles.jobActionButton}
@@ -1012,7 +1285,7 @@ export default function JobCardScreen({ route, navigation }) {
               />
             </View>
             <Text style={styles.jobActionsHint}>
-              Pause keeps this job in your queue. End Job saves the card and closes it.
+              {paused ? 'On hold — Resume to carry on. ' : ''}Pause keeps this job in your queue. End Job saves the card and closes it.
             </Text>
           </>
         ) : jobSettingComplete && canPunch ? (
@@ -1030,7 +1303,26 @@ export default function JobCardScreen({ route, navigation }) {
           </Text>
         )}
 
+        {/* A job can go on hold during Job Setting too -- a break doesn't
+            wait for production to start. Offered once something has been
+            punched here; before that there is nothing running to hold. */}
+        {!productionStarted && startedHereRef.current && !runningOnOther ? (
+          <>
+            <View style={styles.spacer} />
+            <Button
+              title={paused ? 'Resume' : 'Pause'}
+              icon={paused ? 'play' : 'pause'}
+              variant={paused ? 'hold' : 'outline'}
+              size="sm"
+              onPress={paused ? handleResumeTap : handlePause}
+              loading={pausing}
+            />
+          </>
+        ) : null}
+
         <View style={styles.spacer} />
+
+        <PauseDialog visible={pauseDialogOpen} onPause={confirmPause} onCancel={() => setPauseDialogOpen(false)} />
 
         <MaterialUsedDialog
           visible={materialUsedVisible}
@@ -1102,6 +1394,54 @@ const styles = StyleSheet.create({
   loadErrorText: { color: colors.dangerStrong, textAlign: 'center', marginBottom: spacing.md, fontFamily },
   backButton: { minWidth: 160 },
   spacer: { height: spacing.md },
+  advanceBanner: {
+    backgroundColor: colors.advanceBg,
+    borderColor: colors.advance,
+    borderWidth: 1,
+    borderLeftWidth: 5,
+    borderRadius: radii.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    marginBottom: spacing.md,
+  },
+  advanceBannerText: { color: colors.advanceText, fontSize: 12.5, fontWeight: '700', fontFamily },
+  holdBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    backgroundColor: colors.holdBg,
+    borderColor: colors.holdBorder,
+    borderWidth: 1,
+    borderLeftWidth: 5,
+    borderLeftColor: colors.hold,
+    borderRadius: radii.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    marginBottom: spacing.md,
+  },
+  holdText: { flex: 1 },
+  holdTitle: { color: colors.holdText, fontSize: 13, fontWeight: '700', fontFamily },
+  holdSub: { color: colors.textMuted, fontSize: 11.5, marginTop: 1, fontFamily },
+  holdButton: {
+    backgroundColor: colors.success,
+    borderRadius: radii.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+  },
+  holdButtonText: { color: '#FFFFFF', fontSize: 13, fontWeight: '700', fontFamily },
+  syncNotice: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    backgroundColor: colors.noticeBg,
+    borderColor: colors.noticeBorder,
+    borderWidth: 1,
+    borderRadius: radii.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    marginBottom: spacing.md,
+  },
+  syncNoticeText: { flex: 1, color: colors.noticeText, fontSize: 12, fontWeight: '600', fontFamily },
   infoLine: { fontSize: 13, color: colors.textDark, marginBottom: 3, fontFamily },
   // .material-id-row -- one row, four columns, tinted panel.
   midRow: {

@@ -8,6 +8,16 @@ import Button from '../theme/Button';
 // scans is a QR (see rollId.js), so the crop region should read as one.
 const FRAME_SIZE = 260;
 
+// Accent blue for the viewfinder corners -- bright enough to read on the black
+// camera view (the brand navy disappears against it). Drawn here, not by the
+// camera: its native frame ignores any opaque frameColor under the new
+// architecture and falls back to green, so the native frame is kept (it is also
+// what limits decoding to the square) but made transparent, and these corners
+// sit exactly where it would have drawn them.
+const FRAME_COLOR = '#2F9BFF';
+const CORNER_LENGTH = 30;
+const CORNER_THICKNESS = 3;
+
 // Mirrors the web form's camera-scan modal (jobCardForm.ejs): a viewfinder
 // frame, decode the QR, hand the payload back.
 //
@@ -97,9 +107,9 @@ export default function ScanScreen({ route, navigation }) {
         showFrame
         // No scanning laser -- the moving red line reads as an error cue and
         // the web modal doesn't have one. 'transparent' hides it while keeping
-        // the corner frame.
+        // the frame.
         laserColor="transparent"
-        frameColor={colors.primary}
+        frameColor="transparent"
         barcodeFrameSize={{ width: FRAME_SIZE, height: FRAME_SIZE }}
       />
 
@@ -147,6 +157,26 @@ export default function ScanScreen({ route, navigation }) {
                 },
               ]}
             />
+            {[
+              { top: 0, left: 0, borderTopWidth: CORNER_THICKNESS, borderLeftWidth: CORNER_THICKNESS },
+              { top: 0, right: 0, borderTopWidth: CORNER_THICKNESS, borderRightWidth: CORNER_THICKNESS },
+              { bottom: 0, left: 0, borderBottomWidth: CORNER_THICKNESS, borderLeftWidth: CORNER_THICKNESS },
+              { bottom: 0, right: 0, borderBottomWidth: CORNER_THICKNESS, borderRightWidth: CORNER_THICKNESS },
+            ].map((corner, i) => (
+              <View
+                key={i}
+                style={[
+                  styles.corner,
+                  {
+                    top: (maskLayout.height - FRAME_SIZE) / 2,
+                    left: (maskLayout.width - FRAME_SIZE) / 2,
+                    width: FRAME_SIZE,
+                    height: FRAME_SIZE,
+                  },
+                ]}>
+                <View style={[styles.cornerMark, corner]} />
+              </View>
+            ))}
           </>
         ) : null}
       </View>
@@ -164,6 +194,14 @@ const styles = StyleSheet.create({
   message: { color: colors.textDark, textAlign: 'center', marginBottom: spacing.md, fontFamily },
   backButton: { minWidth: 160 },
   dim: { position: 'absolute', backgroundColor: 'rgba(0,0,0,0.6)' },
+  // One full-size box per corner so each mark can hug its own corner of the square.
+  corner: { position: 'absolute' },
+  cornerMark: {
+    position: 'absolute',
+    width: CORNER_LENGTH,
+    height: CORNER_LENGTH,
+    borderColor: FRAME_COLOR,
+  },
   instructions: {
     position: 'absolute',
     top: spacing.xl,

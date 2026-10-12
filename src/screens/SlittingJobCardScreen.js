@@ -1,27 +1,47 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator, AppState } from 'react-native';
 import { KeyboardAwareScrollView } from 'react-native-keyboard-aware-scroll-view';
+import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
 import { colors, radii, spacing, fontFamily } from '../theme/theme';
 import Card from '../theme/Card';
 import Button from '../theme/Button';
 import AppDialog from '../theme/AppDialog';
 import Toast, { useToast } from '../theme/Toast';
 import JobSettingRow from './jobcard/JobSettingRow';
+import PauseDialog from './jobcard/PauseDialog';
 import DeckleWebStrip from './slitting/DeckleWebStrip';
 import ScanDeckleStrip from './slitting/ScanDeckleStrip';
 import SlittingDeckleRow, { rowMeter, curedNow } from './slitting/SlittingDeckleRow';
+import SlittingLayoutDialog from './slitting/SlittingLayoutDialog';
 import {
   getSlittingCard,
   saveSlittingSetting,
   swapSlittingDeckle,
+  reorderSlittingCuts,
   startSlittingRow,
   produceSlittingRow,
   editSlittingJoint,
+  claimSlitting,
+  heartbeatSlitting,
+  settingStartSlitting,
+  settingStopSlitting,
+  pauseSlitting,
+  resumeSlitting,
   ApiError,
 } from '../services/api';
 import { normalizeRollId } from '../utils/rollId';
 import { validateStartMtrs, validateStopMtrs, fmtMtrs } from '../utils/meters';
 import { playScanSuccess, playScanError } from '../utils/scanFeedback';
+import { getJson, setJson, removeJson } from '../storage/jsonStorage';
+import { STORAGE_KEYS } from '../constants/storageKeys';
+import { printQueue } from '../services/printQueue';
+import {
+  startDeckle as startOvertimeTimer,
+  stopRun as stopOvertimeTimer,
+  pauseJob as pauseOvertimeTimers,
+  resumeJob as resumeOvertimeTimers,
+  startBreak as startBreakTimer,
+} from '../services/overtimeReminder';
 
 // The SLITTING job card -- the step AFTER lamination. JobCardScreen turns raw
 // reels into Deckles (Semi Finished Goods); this one cuts one of those webs
@@ -69,6 +89,35 @@ const matchDeckle = (rows, raw) => {
   return hits.length ? hits[0].i : null;
 };
 
+// Decks that share the SAME knife layout -- the same roll widths in the same
+// order -- are drawn once, bundled under one wrapper, rather than repeating an
+// identical strip per Deckle. The web/reel width is deliberately NOT part of the
+// key: each reel carries its own size, so two decks can run the very same knife
+// layout on webs that differ by a few mm. Groups keep the order of their first
+// member; a lone Deckle is a group of one (drawn as before).
+const layoutKey = row =>
+  (row.cuts || [])
+    .filter(c => Number(c.width) > 0)
+    .map(c => round2(c.width))
+    .join('+');
+
+const groupByLayout = rows => {
+  const groups = [];
+  const byKey = new Map();
+  rows.forEach((row, index) => {
+    // A deck with no roll widths has no layout to share.
+    const key = layoutKey(row) || `none-${index}`;
+    let group = byKey.get(key);
+    if (!group) {
+      group = { key, items: [] };
+      byKey.set(key, group);
+      groups.push(group);
+    }
+    group.items.push({ row, index });
+  });
+  return groups;
+};
+
 const dashed = value =>
   value === null || value === undefined || String(value).trim() === '' ? '—' : String(value);
 
@@ -91,7 +140,14 @@ export default function SlittingJobCardScreen({ route, navigation }) {
   const [busyIndex, setBusyIndex] = useState(null);
   const [editingJsIndex, setEditingJsIndex] = useState(null);
   const [editingRowIndex, setEditingRowIndex] = useState(null);
+  // Row whose knife layout is being re-arranged (index into `rows`), or null.
+  const [layoutIndex, setLayoutIndex] = useState(null);
+  const [layoutSaving, setLayoutSaving] = useState(false);
   const [dialog, setDialog] = useState(null);
+  // On hold -- { reason } while this device has the card paused. The office's
+  // Slitting WIP page shows it ON HOLD; any punch (or Resume) ends it.
+  const [paused, setPaused] = useState(null);
+  const [pauseDialogOpen, setPauseDialogOpen] = useState(false);
   const { toast, showToast, hideToast } = useToast();
   // Bumped once a minute while something is still curing, purely to re-run the
   // clock check in curedNow -- a card left open on the machine should unlock
@@ -123,16 +179,33 @@ export default function SlittingJobCardScreen({ route, navigation }) {
       const alreadyRunning = (loaded.rows || []).some(r => r.startTime || r.status === 'done');
       setProductionStarted(jsAlreadyDone || alreadyRunning);
 
-      // The machine counter is continuous: Job Setting's last Stop reading is
-      // exactly where the first Deckle's Start begins, so don't make the
-      // operator re-key it.
-      const seed = jsAlreadyDone ? savedJs[savedJs.length - 1].mtrs2 : null;
-      const firstPending = (loaded.rows || []).findIndex(r => r.status !== 'done' && !r.startTime);
-      setDrafts(
-        firstPending >= 0 && seed !== null && seed !== undefined && seed !== ''
-          ? { [firstPending]: { ...emptyDraft(), startMtrs: String(seed) } }
-          : {},
-      );
+      // The first Deckle's Start reading is left blank for the operator to key
+      // in -- Job Setting's last Stop reading is NOT carried over into the
+      // Production Log automatically.
+      setDrafts({});
+
+      // Restore the Deckle this card had scanned/confirmed when it was last left
+      // (kept per card in AsyncStorage), falling back to a row already running --
+      // so the Scan Deckle field shows the confirmed Deckle again instead of
+      // going blank every time the card is reopened.
+      const rowsArr = loaded.rows || [];
+      let armIdx = null;
+      try {
+        const saved = await getJson(STORAGE_KEYS.SLITTING_ARMED_PREFIX + cardId, null);
+        if (saved && Number.isInteger(saved.index) && rowsArr[saved.index] && rowsArr[saved.index].status !== 'done') {
+          armIdx = saved.index;
+        }
+      } catch (e) {
+        // ignore a bad/corrupt stored value -- fall back below
+      }
+      if (armIdx === null) {
+        const runningIdx = rowsArr.findIndex(r => r.status !== 'done' && r.startTime);
+        if (runningIdx >= 0) armIdx = runningIdx;
+      }
+      if (armIdx !== null) {
+        setArmedIndex(armIdx);
+        setScanStatus({ tone: 'ok', message: `${rowsArr[armIdx].deckleId} confirmed — punch Start when the machine runs.` });
+      }
     } catch (err) {
       setLoadError(err instanceof ApiError ? err.message : 'Could not load this slitting card.');
     } finally {
@@ -143,6 +216,51 @@ export default function SlittingJobCardScreen({ route, navigation }) {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Claim this card for this device and keep the claim fresh while the screen is
+  // open -- the office's Slitting WIP page reads it as "operator app online" and
+  // lists the card as running. Best-effort: a lost claim never blocks the floor.
+  // Android freezes JS timers while the screen is off, so a beat is also sent the
+  // moment the app returns to the foreground.
+  useEffect(() => {
+    if (!card) {
+      return undefined;
+    }
+    claimSlitting(cardId).catch(() => {});
+    const beat = () => heartbeatSlitting(cardId).catch(() => {});
+    const timer = setInterval(beat, 60000);
+    const sub = AppState.addEventListener('change', state => {
+      if (state === 'active') beat();
+    });
+    return () => {
+      clearInterval(timer);
+      sub.remove();
+    };
+  }, [card, cardId]);
+
+  // Pause / Resume -- the operator stepping away without ending the card. The
+  // office's WIP page then shows it ON HOLD and freezes its clock. Any punch also
+  // ends the hold server-side, so the local flag is cleared on every punch too.
+  const handlePause = () => setPauseDialogOpen(true);
+  const confirmPause = reason => {
+    setPauseDialogOpen(false);
+    setPaused({ reason });
+    pauseSlitting({ cardId, reason }).catch(() => {});
+    pauseOvertimeTimers(cardId);
+    // Tea / Lunch Break: the "break is over" alarm is timed from this tap.
+    startBreakTimer({ jobId: cardId, reason, label: card.slittingJobCardId, machineName: card.machineName });
+  };
+  const handleResume = () => {
+    setPaused(null);
+    resumeSlitting({ cardId }).catch(() => {});
+    resumeOvertimeTimers(cardId);
+  };
+  const clearPaused = () => setPaused(p => (p ? null : p));
+  // End Job just leaves the card: unlike the lamination card there is no
+  // end-of-run save to make -- every Deckle is inwarded the moment its Stop is
+  // punched -- so this only closes the card, which stays in the queue until its
+  // last Deckle is slit. Named to match the coating card's own End Job button.
+  const handleEndJob = () => navigation.navigate('Home');
 
   const anyCuring = rows.some(r => r.status !== 'done' && !curedNow(r));
   useEffect(() => {
@@ -175,11 +293,53 @@ export default function SlittingJobCardScreen({ route, navigation }) {
   const patchRow = (index, patch) =>
     setRows(list => list.map((r, i) => (i === index ? { ...r, ...patch } : r)));
 
+  // ── Layout ─────────────────────────────────────────────────────────────
+  // The operator may lay the same knife widths out in a different order across
+  // the web (210+210+230 -> 210+230+210) until that Deckle is started. Saved
+  // server-side, so the rolls minted at Stop (<deckle>-<slot>) follow it.
+  const layoutEditable = row =>
+    row.status !== 'done' && !row.startTime && (row.cuts || []).filter(c => Number(c.width) > 0).length > 1;
+
+  const saveLayout = async order => {
+    const index = layoutIndex;
+    if (index === null) {
+      return;
+    }
+    setLayoutSaving(true);
+    try {
+      const res = await reorderSlittingCuts({ cardId, index, order });
+      patchRow(index, { cuts: res.cuts });
+      setLayoutIndex(null);
+      showToast('Layout updated.', 'success');
+    } catch (err) {
+      setLayoutIndex(null);
+      setDialog({
+        tone: 'error',
+        title: "Couldn't change the layout",
+        message: err instanceof ApiError ? err.message : 'Please try again.',
+      });
+    } finally {
+      setLayoutSaving(false);
+    }
+  };
+
   // ── Scan ───────────────────────────────────────────────────────────────
+  // The confirmed Deckle is remembered per card (AsyncStorage) so the Scan
+  // Deckle field survives leaving and reopening the card -- arming is a
+  // client-side state with no server punch behind it (a plain match) until
+  // Start, so without this it was lost every time the screen unmounted.
+  const armedKey = STORAGE_KEYS.SLITTING_ARMED_PREFIX + cardId;
   const armRow = (index, message) => {
     playScanSuccess();
     setArmedIndex(index);
     setScanStatus({ tone: 'ok', message });
+    setJson(armedKey, { index }).catch(() => {});
+  };
+  // Clear the armed Deckle, in state and in storage, together -- used by every
+  // path that sets it back to "nothing confirmed" (a bad scan, Rescan, produce).
+  const disarm = () => {
+    setArmedIndex(null);
+    removeJson(armedKey).catch(() => {});
   };
 
   // A scan doesn't have to be the exact Deckle the planner allocated -- any
@@ -192,13 +352,13 @@ export default function SlittingJobCardScreen({ route, navigation }) {
     if (i !== null) {
       if (rows[i].status === 'done') {
         playScanError();
-        setArmedIndex(null);
+        disarm();
         setScanStatus({ tone: 'bad', message: `${rows[i].deckleId} has already been run on this card.` });
         return;
       }
       if (!curedNow(rows[i])) {
         playScanError();
-        setArmedIndex(null);
+        disarm();
         const when = rows[i].curing?.curedAtLabel ? ` — ready at ${rows[i].curing.curedAtLabel}` : '';
         setScanStatus({
           tone: 'bad',
@@ -213,7 +373,7 @@ export default function SlittingJobCardScreen({ route, navigation }) {
     const target = rows.findIndex(r => r.status !== 'done');
     if (target === -1) {
       playScanError();
-      setArmedIndex(null);
+      disarm();
       setScanStatus({ tone: 'bad', message: 'Every Deckle on this card has already been run.' });
       return;
     }
@@ -232,7 +392,7 @@ export default function SlittingJobCardScreen({ route, navigation }) {
       armRow(target, `${label} confirmed — punch Start when the machine runs.`);
     } catch (err) {
       playScanError();
-      setArmedIndex(null);
+      disarm();
       setScanStatus({
         tone: 'bad',
         message: err instanceof ApiError ? err.message : 'That Deckle is not on this card.',
@@ -242,9 +402,33 @@ export default function SlittingJobCardScreen({ route, navigation }) {
     }
   };
 
+  // Opened from a same-layout group tile on the queue, which already scanned the
+  // Deckle to find this card: confirm it here exactly as a scan on this screen
+  // would, once the card's rows have loaded. Once only.
+  const handoffRef = useRef(false);
+  useEffect(() => {
+    const raw = route.params?.armDeckle;
+    if (!raw || loading || loadError || !rows.length || handoffRef.current) {
+      return;
+    }
+    handoffRef.current = true;
+    navigation.setParams({ armDeckle: undefined });
+    armFrom(raw);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [route.params?.armDeckle, loading, loadError, rows]);
+
   const openScan = () => {
     scanTargetRef.current = value => armFrom(value);
     navigation.navigate('Scan', { returnTo: 'SlittingJobCard' });
+  };
+
+  // Un-confirm the armed Deckle so the scan input comes back -- the operator
+  // grabbed the wrong reel, or wants to run a different web. This also drops
+  // the armed row's live Start (its gate is `armed`), which is correct: nothing
+  // should be punchable until a Deckle is confirmed again.
+  const rescan = () => {
+    disarm();
+    setScanStatus({ tone: '', message: 'Scan the Deckle you are about to run.' });
   };
 
   // ── Job Setting ────────────────────────────────────────────────────────
@@ -279,7 +463,11 @@ export default function SlittingJobCardScreen({ route, navigation }) {
       return;
     }
     touchJs();
+    clearPaused();
     setJobSetting(list => list.map((r, i) => (i === index ? { ...r, startTime: time } : r)));
+    // Live JOB SETTING phase for the office's WIP page (bulk save still records
+    // the readings). Fire-and-forget: a missed punch is re-stamped by the next.
+    settingStartSlitting({ cardId, index, startTime: time, startMtrs: jobSetting[index]?.mtrs1 }).catch(() => {});
   };
   const stopJsRow = (index, time) => {
     const error = validateStopMtrs(jobSetting[index]?.mtrs1, jobSetting[index]?.mtrs2);
@@ -288,7 +476,9 @@ export default function SlittingJobCardScreen({ route, navigation }) {
       return;
     }
     touchJs();
+    clearPaused();
     setJobSetting(list => list.map((r, i) => (i === index ? { ...r, stopTime: time } : r)));
+    settingStopSlitting({ cardId, index }).catch(() => {});
   };
 
   const jobSettingComplete = jobSetting.length > 0 && jobSetting.every(r => r.startTime && r.stopTime);
@@ -299,13 +489,8 @@ export default function SlittingJobCardScreen({ route, navigation }) {
       await saveSlittingSetting({ cardId, rows: jsPayload() });
       jsDirtyRef.current = false;
       setProductionStarted(true);
-      // Seed the first not-yet-started row's Start reading off Job Setting's
-      // last Stop -- one continuous counter, so it is the same number.
-      const last = jobSetting[jobSetting.length - 1]?.mtrs2;
-      const firstPending = rows.findIndex(r => r.status !== 'done' && !r.startTime);
-      if (firstPending >= 0 && String(last ?? '').trim() && !draftFor(firstPending).startMtrs) {
-        setDraft(firstPending, 'startMtrs', String(last));
-      }
+      // The first Deckle's Start reading is left for the operator to key in --
+      // Job Setting's last Stop reading is NOT carried into the Production Log.
     } catch (err) {
       showToast(err instanceof ApiError ? err.message : "Couldn't save Job Setting.");
     } finally {
@@ -346,6 +531,7 @@ export default function SlittingJobCardScreen({ route, navigation }) {
       return;
     }
     setBusyIndex(index);
+    clearPaused();
     try {
       const res = await startSlittingRow({
         cardId,
@@ -354,6 +540,20 @@ export default function SlittingJobCardScreen({ route, navigation }) {
         startMtrs: Number(draft.startMtrs),
       });
       patchRow(index, { startTime: res.startTime || time, startMtrs: res.startMtrs ?? Number(draft.startMtrs) });
+      // The overtime reminder times this Deckle from this punch, on the tablet:
+      // its planned metres over the machine's speed (Machine Master).
+      startOvertimeTimer({
+        kind: 'slitting',
+        jobId: cardId,
+        runKey: index,
+        deckleNo: index + 1,
+        deckleId: row.deckleId,
+        label: card.slittingJobCardId,
+        machineName: card.machineName,
+        mtrs: Number(row.plannedMeter) > 0 ? row.plannedMeter : row.meter,
+        speedMpm: card.timing?.speedMpm,
+        at: Date.now(),
+      });
       showToast(`Started ${row.deckleId} at ${res.startTime || time}`, 'success');
     } catch (err) {
       showToast(err instanceof ApiError ? err.message : "Couldn't record the start.");
@@ -381,6 +581,7 @@ export default function SlittingJobCardScreen({ route, navigation }) {
         endTime: time,
       });
 
+      stopOvertimeTimer('slitting', cardId, index);
       const producedIds = res.rollIds || [];
       setRows(list =>
         list.map((r, i) =>
@@ -400,8 +601,18 @@ export default function SlittingJobCardScreen({ route, navigation }) {
             : r,
         ),
       );
-      setArmedIndex(null);
+      disarm();
       setScanStatus({ tone: '', message: 'Scan the next Deckle.' });
+
+      // Auto-print each finished roll's label (A, B, C...), the same way the
+      // lamination card auto-prints a produced Deckle: the print queue fetches
+      // each label from the server and sends it to the connected printer.
+      // Punching Stop never waits on the printer.
+      (res.rolls || []).forEach(roll => {
+        if (roll?.stockId) {
+          printQueue.enqueue({ stockId: roll.stockId, rollId: roll.rollId, productCode: roll.productCode, kind: 'finished' });
+        }
+      });
 
       if (res.cardCompleted) {
         setDialog({
@@ -463,11 +674,19 @@ export default function SlittingJobCardScreen({ route, navigation }) {
     // The length wound on each finished roll is the plan's own fixed figure,
     // not the operator's to key in -- a row without one was never allocated
     // properly and has to go back to Slitting Allocation.
-    const runningMeter = Number(row.plannedRunningMeter);
-    if (!(runningMeter > 0)) {
+    const plannedRunningMeter = Number(row.plannedRunningMeter);
+    if (!(plannedRunningMeter > 0)) {
       showToast('This Deckle has no R. Meter planned — ask the office to reopen its allocation.');
       return;
     }
+    // A Deckle that ran short (damage, a break) winds shorter rolls: scale the
+    // planned length by what actually came off, so the label and stock carry the
+    // real metres instead of the planned figure. Never scaled up past the plan.
+    const plannedMeter = Number(row.plannedMeter);
+    const runningMeter =
+      plannedMeter > 0 && meter < plannedMeter
+        ? round2((plannedRunningMeter * meter) / plannedMeter)
+        : plannedRunningMeter;
 
     const rollCount = (row.cuts || []).filter(c => Number(c.width) > 0).length;
     setDialog({
@@ -509,6 +728,7 @@ export default function SlittingJobCardScreen({ route, navigation }) {
     }
   };
 
+  const layoutGroups = useMemo(() => groupByLayout(rows), [rows]);
   const pendingRows = useMemo(() => rows.filter(r => r.status !== 'done'), [rows]);
   const totalPlannedRolls = useMemo(
     () => rows.reduce((n, r) => n + (r.cuts || []).filter(c => Number(c.width) > 0).length, 0),
@@ -559,19 +779,121 @@ export default function SlittingJobCardScreen({ route, navigation }) {
             the card's own rows. Purely descriptive -- nothing here is this
             screen's to change. */}
         <Card title="Deckle Description">
-          {rows.map((row, i) => (
-            <View key={i} style={[styles.descRow, i > 0 && styles.descRowDivider]}>
+          {layoutGroups.map((group, g) => {
+            const renderHead = ({ row, index }) => (
               <View style={styles.descHead}>
-                <Text style={styles.descDeckleId} numberOfLines={1}>
+                <Text style={[styles.descDeckleId, row.status === 'done' && styles.descDone]} numberOfLines={1}>
                   {dashed(row.deckleId)}
+                  {row.status === 'done' ? ' · done' : ''}
                 </Text>
                 <Text style={styles.descMeta}>
                   {fmtMtrs(row.width)} mm · {fmtMtrs(row.plannedMeter)} m
                 </Text>
+                {layoutEditable(row) ? (
+                  <TouchableOpacity
+                    style={styles.rearrangeBtn}
+                    activeOpacity={0.7}
+                    onPress={() => setLayoutIndex(index)}
+                    accessibilityLabel={`Reorder the layout of ${row.deckleId}`}>
+                    <Icon name="swap-horizontal" size={14} color={colors.primary} />
+                    <Text style={styles.rearrangeText}>Reorder</Text>
+                  </TouchableOpacity>
+                ) : null}
               </View>
-              <DeckleWebStrip row={row} />
-            </View>
-          ))}
+            );
+
+            if (group.items.length === 1) {
+              const item = group.items[0];
+              return (
+                <View key={group.key} style={[styles.descRow, g > 0 && styles.descRowDivider]}>
+                  {renderHead(item)}
+                  <DeckleWebStrip row={item.row} />
+                </View>
+              );
+            }
+
+            // Same layout on several Deckles: one grouped card. Header names the
+            // layout and how many Deckles run it, the strip is drawn once, and
+            // every Deckle that runs it is a numbered row underneath.
+            const doneCount = group.items.filter(({ row }) => row.status === 'done').length;
+            const totalMeter = group.items.reduce((n, { row }) => n + (Number(row.plannedMeter) || 0), 0);
+            return (
+              <View key={group.key} style={[styles.descRow, g > 0 && styles.descRowDivider]}>
+                <View style={styles.bundle}>
+                  <View style={styles.bundleAccent} />
+                  <View style={styles.bundleBody}>
+                    <View style={styles.bundleHeader}>
+                      <View style={styles.bundleIcon}>
+                        <Icon name="layers-triple-outline" size={18} color={colors.primary} />
+                      </View>
+                      <View style={styles.bundleHeadText}>
+                        <Text style={styles.bundleEyebrow}>SHARED LAYOUT</Text>
+                        <Text style={styles.bundleTitle} numberOfLines={2}>
+                          {group.key.split('+').join('  ·  ')} mm
+                        </Text>
+                      </View>
+                      <View style={styles.bundleCount}>
+                        <Text style={styles.bundleCountNum}>{group.items.length}</Text>
+                        <Text style={styles.bundleCountText}>Deckles</Text>
+                      </View>
+                    </View>
+
+                    <View style={styles.bundleStrip}>
+                      <DeckleWebStrip row={group.items[0].row} />
+                    </View>
+
+                    <Text style={styles.bundleListLabel}>RUNS ON</Text>
+                    <View style={styles.bundleList}>
+                      {group.items.map(({ row, index }, i) => {
+                        const done = row.status === 'done';
+                        return (
+                          <View key={index} style={[styles.bundleItem, i > 0 && styles.bundleItemDivider]}>
+                            <View style={[styles.bundleNum, done && styles.bundleNumDone]}>
+                              {done ? (
+                                <Icon name="check" size={13} color="#FFFFFF" />
+                              ) : (
+                                <Text style={styles.bundleNumText}>{i + 1}</Text>
+                              )}
+                            </View>
+                            <View style={styles.bundleItemMain}>
+                              <Text style={[styles.bundleItemId, done && styles.descDone]} numberOfLines={1}>
+                                {dashed(row.deckleId)}
+                              </Text>
+                              <Text style={styles.descMeta} numberOfLines={1}>
+                                {fmtMtrs(row.width)} mm web · {fmtMtrs(row.plannedMeter)} m
+                              </Text>
+                            </View>
+                            <View style={[styles.statusChip, done ? styles.statusChipDone : styles.statusChipPending]}>
+                              <Text style={[styles.statusChipText, done ? styles.statusTextDone : styles.statusTextPending]}>
+                                {done ? 'Done' : 'Pending'}
+                              </Text>
+                            </View>
+                            {layoutEditable(row) ? (
+                              <TouchableOpacity
+                                style={styles.reorderIconBtn}
+                                activeOpacity={0.7}
+                                hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                                onPress={() => setLayoutIndex(index)}
+                                accessibilityLabel={`Reorder the layout of ${row.deckleId}`}>
+                                <Icon name="swap-horizontal" size={18} color={colors.primary} />
+                              </TouchableOpacity>
+                            ) : null}
+                          </View>
+                        );
+                      })}
+                    </View>
+
+                    <View style={styles.bundleFooter}>
+                      <Text style={styles.bundleFooterText}>
+                        {doneCount} of {group.items.length} done
+                      </Text>
+                      <Text style={styles.bundleFooterTotal}>Total {fmtMtrs(totalMeter)} m</Text>
+                    </View>
+                  </View>
+                </View>
+              </View>
+            );
+          })}
         </Card>
 
         <View style={styles.spacer} />
@@ -583,8 +905,11 @@ export default function SlittingJobCardScreen({ route, navigation }) {
           <ScanDeckleStrip
             status={scanStatus}
             busy={scanBusy}
+            confirmed={armedIndex !== null}
+            confirmedId={armedIndex !== null ? dashed(rows[armedIndex]?.deckleId) : ''}
             onSubmit={armFrom}
             onScanRequest={openScan}
+            onRescan={rescan}
           />
         </Card>
 
@@ -598,7 +923,7 @@ export default function SlittingJobCardScreen({ route, navigation }) {
             <JobSettingRow
               key={index}
               row={row}
-              index={index + 1}
+              index={index}
               // No material gate here: slitting's material IS the allocated
               // Deckle, confirmed in its own step above, so there is nothing
               // to mount before a setup punch.
@@ -668,13 +993,6 @@ export default function SlittingJobCardScreen({ route, navigation }) {
               ) : null}
             </Card>
 
-            <View style={styles.spacer} />
-            <Button
-              title={pendingRows.length ? 'Back to Queue' : 'Done'}
-              icon={pendingRows.length ? 'arrow-left' : 'check'}
-              variant={pendingRows.length ? 'outline' : 'primary'}
-              onPress={() => navigation.navigate('Home')}
-            />
             <Text style={styles.hintText}>
               {pendingRows.length
                 ? 'Every punch is already saved — this card stays in your queue until its last Deckle is slit.'
@@ -700,6 +1018,42 @@ export default function SlittingJobCardScreen({ route, navigation }) {
 
         <View style={styles.spacer} />
 
+        {/* Pause + End Job at the bottom -- the two ways out of a running card,
+            the same pair the coating card shows (JobCardScreen's jobActionsRow).
+            Pause keeps it in the queue and freezes its clock on the office's WIP
+            page; every Deckle is already saved as it's slit, so End Job just
+            closes the card. */}
+        <View style={styles.jobActionsRow}>
+          <Button
+            title={paused ? 'Resume' : 'Pause'}
+            icon={paused ? 'play' : 'pause'}
+            variant={paused ? 'hold' : 'outline'}
+            size="sm"
+            onPress={paused ? handleResume : handlePause}
+            style={styles.jobActionButton}
+          />
+          <Button
+            title="End Job"
+            icon="check"
+            size="sm"
+            onPress={handleEndJob}
+            style={styles.jobActionButton}
+          />
+        </View>
+        <Text style={styles.jobActionsHint}>
+          {paused ? 'On hold — Resume to carry on. ' : ''}Pause keeps this card in your queue. Every Deckle is saved as it's slit — End Job just closes the card.
+        </Text>
+
+        <View style={styles.spacer} />
+
+        <SlittingLayoutDialog
+          visible={layoutIndex !== null}
+          row={layoutIndex !== null ? rows[layoutIndex] : null}
+          saving={layoutSaving}
+          onCancel={() => setLayoutIndex(null)}
+          onSave={saveLayout}
+        />
+
         <AppDialog
           visible={!!dialog}
           tone={dialog?.tone}
@@ -709,6 +1063,8 @@ export default function SlittingJobCardScreen({ route, navigation }) {
           onRequestClose={() => setDialog(null)}
         />
       </KeyboardAwareScrollView>
+
+      <PauseDialog visible={pauseDialogOpen} onPause={confirmPause} onCancel={() => setPauseDialogOpen(false)} />
 
       <Toast toast={toast} onHide={hideToast} />
     </View>
@@ -738,6 +1094,10 @@ const styles = StyleSheet.create({
   loadErrorText: { color: colors.dangerStrong, textAlign: 'center', marginBottom: spacing.md, fontFamily },
   backButton: { minWidth: 160 },
   spacer: { height: spacing.md },
+  // Pause + End Job bottom bar, matching the coating card (JobCardScreen).
+  jobActionsRow: { flexDirection: 'row', gap: spacing.md },
+  jobActionButton: { flex: 1 },
+  jobActionsHint: { marginTop: spacing.sm, fontSize: 11.5, color: colors.textMuted, textAlign: 'center', fontFamily },
   midRow: {
     flexDirection: 'row',
     alignItems: 'flex-start',
@@ -766,12 +1126,122 @@ const styles = StyleSheet.create({
   descRowDivider: { borderTopWidth: 1, borderTopColor: colors.borderLight },
   descHead: {
     flexDirection: 'row',
-    alignItems: 'baseline',
+    alignItems: 'center',
     justifyContent: 'space-between',
     gap: spacing.sm,
     marginBottom: spacing.sm,
   },
   descDeckleId: { flex: 1, fontSize: 13, fontWeight: '800', color: colors.textDark, fontFamily },
+  rearrangeBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingVertical: 3,
+    paddingHorizontal: spacing.sm,
+    borderWidth: 1,
+    borderColor: colors.primary,
+    borderRadius: radii.pill,
+  },
+  rearrangeText: { color: colors.primary, fontSize: 12, fontWeight: '700', fontFamily },
+  descDone: { color: colors.textMuted },
+  bundle: {
+    flexDirection: 'row',
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radii.md,
+    backgroundColor: colors.cardBg,
+    overflow: 'hidden',
+  },
+  bundleAccent: { width: 4, backgroundColor: colors.primary },
+  bundleBody: { flex: 1, padding: spacing.md },
+  bundleHeader: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  bundleIcon: {
+    width: 34,
+    height: 34,
+    borderRadius: radii.sm,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.infoPanelBg,
+  },
+  bundleHeadText: { flex: 1 },
+  bundleEyebrow: {
+    fontSize: 9.5,
+    fontWeight: '700',
+    letterSpacing: 0.8,
+    color: colors.textMuted,
+    fontFamily,
+  },
+  bundleTitle: { fontSize: 15, fontWeight: '800', color: colors.textDark, fontFamily },
+  bundleCount: {
+    alignItems: 'center',
+    paddingVertical: 3,
+    paddingHorizontal: spacing.sm + 2,
+    borderRadius: radii.sm,
+    backgroundColor: colors.primary,
+  },
+  bundleCountNum: { color: '#FFFFFF', fontSize: 15, fontWeight: '800', lineHeight: 17, fontFamily },
+  bundleCountText: { color: '#FFFFFF', fontSize: 9, fontWeight: '600', opacity: 0.85, fontFamily },
+  bundleStrip: { marginTop: spacing.md },
+  bundleListLabel: {
+    marginTop: spacing.md,
+    marginBottom: spacing.xs,
+    fontSize: 9.5,
+    fontWeight: '700',
+    letterSpacing: 0.8,
+    color: colors.textMuted,
+    fontFamily,
+  },
+  bundleList: {
+    borderWidth: 1,
+    borderColor: colors.borderLight,
+    borderRadius: radii.sm,
+    backgroundColor: colors.headerRowBg,
+    paddingHorizontal: spacing.sm,
+  },
+  bundleItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    paddingVertical: spacing.sm,
+  },
+  bundleItemDivider: { borderTopWidth: 1, borderTopColor: colors.borderLight },
+  bundleNum: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.infoPanelBg,
+    borderWidth: 1,
+    borderColor: colors.primary,
+  },
+  bundleNumDone: { backgroundColor: '#059669', borderColor: '#059669' },
+  bundleNumText: { fontSize: 11, fontWeight: '800', color: colors.primary, fontFamily },
+  bundleItemMain: { flex: 1 },
+  bundleItemId: { fontSize: 13.5, fontWeight: '800', color: colors.textDark, fontFamily },
+  statusChip: { paddingVertical: 2, paddingHorizontal: spacing.sm, borderRadius: radii.pill },
+  statusChipPending: { backgroundColor: colors.advanceBg },
+  statusChipDone: { backgroundColor: colors.rowMatchBg },
+  statusChipText: { fontSize: 10.5, fontWeight: '700', fontFamily },
+  statusTextPending: { color: colors.advanceText },
+  statusTextDone: { color: '#166534' },
+  reorderIconBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: colors.primary,
+  },
+  bundleFooter: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: spacing.sm,
+  },
+  bundleFooterText: { fontSize: 11.5, fontWeight: '600', color: colors.textMuted, fontFamily },
+  bundleFooterTotal: { fontSize: 12.5, fontWeight: '800', color: colors.primary, fontFamily },
   descMeta: { fontSize: 11.5, fontWeight: '600', color: colors.textMuted, fontFamily },
   addRowButton: { alignSelf: 'flex-start', marginTop: spacing.xs },
   addRowText: { color: colors.primary, fontWeight: '600', fontSize: 13, fontFamily },

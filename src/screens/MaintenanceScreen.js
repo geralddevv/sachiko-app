@@ -18,6 +18,7 @@ import Button from '../theme/Button';
 import { getMaintenance, getMediaAuth, maintenanceMediaSource, ApiError, isOfflineError } from '../services/api';
 import { useOffline, useOnReconnect } from '../services/connectivity';
 import { formatDateTime } from '../utils/datetime';
+import VoicePlayer from './maintenance/VoicePlayer';
 
 // Rendered as the "Maintenance" panel inside HomeScreen's segmented toggle
 // (reached via the toggle, not a nav push), so it carries no nav-bar header of
@@ -40,8 +41,27 @@ function StatusPill({ status }) {
   );
 }
 
+// "0:07" -> 7. The ticket row carries the length as a label only.
+function parseClock(label) {
+  const [m, s] = String(label || '').split(':').map(Number);
+  return Number.isFinite(m) && Number.isFinite(s) ? m * 60 + s : 0;
+}
+
 function MediaTile({ media, ticketId, mediaAuth, onView }) {
   const source = maintenanceMediaSource(mediaAuth, ticketId, media.index, { thumb: true });
+  if (media.kind === 'audio') {
+    // No picture for a voice message -- a mic tile that opens the player.
+    return (
+      <TouchableOpacity
+        activeOpacity={0.85}
+        style={[styles.tile, styles.tileAudio]}
+        onPress={() => onView(media)}
+        accessibilityLabel="Play voice message">
+        <Icon name="microphone" size={28} color="#FFFFFF" />
+        {media.durationLabel ? <Text style={styles.tileLen}>{media.durationLabel}</Text> : null}
+      </TouchableOpacity>
+    );
+  }
   return (
     <TouchableOpacity activeOpacity={0.85} style={styles.tile} onPress={() => onView(media)}>
       <Image source={source} style={styles.tileImage} resizeMode="cover" />
@@ -230,7 +250,16 @@ export default function MaintenanceScreen({ navigation }) {
           </TouchableOpacity>
 
           {viewer && mediaAuth ? (
-            viewer.media.kind === 'video' ? (
+            viewer.media.kind === 'audio' ? (
+              <View style={styles.viewerAudio}>
+                <VoicePlayer
+                  onDark
+                  autoPlay
+                  source={maintenanceMediaSource(mediaAuth, viewer.ticket._id, viewer.media.index)}
+                  durationSec={parseClock(viewer.media.durationLabel)}
+                />
+              </View>
+            ) : viewer.media.kind === 'video' ? (
               <Video
                 source={maintenanceMediaSource(mediaAuth, viewer.ticket._id, viewer.media.index)}
                 style={styles.viewerImage}
@@ -251,7 +280,9 @@ export default function MaintenanceScreen({ navigation }) {
           ) : null}
 
           <Text style={styles.viewerHint}>
-            {viewer?.media?.kind === 'video' ? 'Tap ✕ to close' : 'Tap the image or ✕ to close'}
+            {viewer?.media?.kind === 'video' || viewer?.media?.kind === 'audio'
+              ? 'Tap ✕ to close'
+              : 'Tap the image or ✕ to close'}
           </Text>
         </View>
       </Modal>
@@ -300,6 +331,8 @@ const styles = StyleSheet.create({
     backgroundColor: colors.headerRowBg,
   },
   tileImage: { width: '100%', height: '100%' },
+  tileAudio: { backgroundColor: colors.primary, alignItems: 'center', justifyContent: 'center' },
+  viewerAudio: { width: '86%' },
   tilePlay: {
     ...StyleSheet.absoluteFillObject,
     alignItems: 'center',

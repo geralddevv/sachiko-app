@@ -33,6 +33,17 @@ export const colors = {
   cardBg: '#FFFFFF',
   headerRowBg: '#F8FAFC',
   infoPanelBg: '#F0F7FF',
+  // Advance order -- a job set before its sales order was placed. The web
+  // app flags it in the same cornflowerblue (.adv-tag in common.css).
+  advance: '#6495ED',
+  advanceBg: '#EAF1FD',
+  advanceText: '#1E3A8A',
+  // A job on hold (Pause) -- slate, the same as the WIP tab's "Paused" on the
+  // web: not a warning, just stopped.
+  hold: '#475569',
+  holdBg: '#F1F5F9',
+  holdBorder: '#CBD5E1',
+  holdText: '#334155',
   textDark: '#1F2A44',
   textMuted: '#6B7280',
   background: '#F4F7FB',

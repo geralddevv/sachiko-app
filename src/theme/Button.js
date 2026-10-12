@@ -7,6 +7,9 @@ const VARIANT_COLORS = {
   primary: colors.primary,
   success: colors.success,
   danger: colors.danger,
+  // A job on hold: the slate the office's WIP tab shows "Paused" in, so the
+  // button that lifts the hold looks like the state it ends.
+  hold: colors.hold,
 };
 
 // A single button component covering the three recurring action colors on
