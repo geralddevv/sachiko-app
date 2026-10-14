@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import React, { useState, useCallback } from 'react';
 import { View, Text, StyleSheet, FlatList, RefreshControl, TouchableOpacity } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
@@ -8,9 +8,11 @@ import { subscribeQueueChanges } from '../services/queueEvents';
 import { getQueue, logout, ApiError, isOfflineError } from '../services/api';
 import { useOffline, useOnReconnect } from '../services/connectivity';
 import { getDraftStates } from '../storage/draftStorage';
-import { normalizeRollId } from '../utils/rollId';
 import { LaminationViewDialog, SlittingViewDialog } from './queue/JobViewDialogs';
 import DeckleSelectDialog from './queue/DeckleSelectDialog';
+// Slitting Deckles are counted by the knife layout, not by the card -- see
+// ./queue/layoutRun.js for what the numbers mean.
+import { groupSlittingByLayout, runOf, layoutKeyOf, formatLayout } from './queue/layoutRun';
 
 // "1:05 PM"
 const clockOf = ms => {
@@ -190,82 +192,65 @@ function ViewButton({ onPress, label }) {
   );
 }
 
-// Slitting cards cut to the same knife layout are bundled under one wrapper in
-// the queue. The server's `layoutSummary` already spells each card's layout as
-// "150 + 200 + 150" (with " × n" when several Deckles run it, and " | " between
-// distinct patterns), so that is the key -- minus the Deckle count, which says
-// how much of it a card has, not what it is. A card with no layout never
-// bundles. Groups keep the order of their first card.
-const layoutKeyOf = card => String(card.layoutSummary || '').replace(/\s*×\s*\d+/g, '').trim();
-
-const groupSlittingByLayout = cards => {
-  const groups = [];
-  const byKey = new Map();
-  cards.forEach(card => {
-    const key = layoutKeyOf(card) || `none-${card._id}`;
-    let group = byKey.get(key);
-    if (!group) {
-      group = { key, layout: layoutKeyOf(card), cards: [] };
-      byKey.set(key, group);
-      groups.push(group);
-    }
-    group.cards.push(card);
-  });
-  return groups;
-};
-
-// Which card of a group a scanned Deckle belongs to. A printed label's QR ends
-// with the Roll ID (the older format starts with it) and a typed entry is the
-// id itself, so matching against the group's own Deckle ids covers both; the
-// longest match wins. Same rule as the job card's own matchDeckle.
-const findScannedDeckle = (cards, raw) => {
-  const compact = normalizeRollId(raw);
-  if (!compact) {
-    return null;
-  }
-  let best = null;
-  cards.forEach(card =>
-    (card.deckles || []).forEach(d => {
-      const id = normalizeRollId(d.id);
-      if (id && (compact === id || compact.endsWith(id) || compact.startsWith(id))) {
-        if (!best || id.length > best.idLength) {
-          best = { card, done: d.done, idLength: id.length };
-        }
-      }
-    }),
-  );
-  return best;
-};
-
 // Several slitting cards cut to the same layout, as ONE tile -- the same shape
 // as a single SlittingCard, headed by the widths and how many jobs it holds.
 // Start opens a picker listing the group's jobs and the Deckles still to slit in
 // each (DeckleSelectDialog); the chosen Deckle opens its job with that Deckle
-// already confirmed. "Scan Deckle instead" keeps the original route -- scan the
-// reel in front of them and the scan says which job it is.
-function SlittingGroupCard({ group, onStart, note }) {
+// already confirmed. View is never dropped just because several cards share
+// this tile -- it opens the job actually running on the machine, or the
+// group's first job when none is, the same representative card Start's
+// "Resume" falls back on above.
+function SlittingGroupCard({ group, onStart, onView }) {
   const cards = group.cards;
-  const sum = fn => cards.reduce((n, c) => n + (fn(c) || 0), 0);
-  const deckles = sum(c => c.deckleCount);
-  const done = sum(c => c.deckleDone);
-  const rollsToMake = sum(c => c.plannedRolls - c.producedRolls);
+  // This tile's progress through its knife layout's run: Deckles done out of
+  // the run's whole total, straight from the server's layoutRunDone -- not
+  // summed off `cards`, which only lists Deckles still pending (a finished
+  // one leaves the queue, so summing those would shrink both the done count
+  // and the total every time one was slit instead of advancing the done
+  // count toward a fixed total).
+  const run = runOf(cards[0]);
+  const deckleTotal = run ? run.total : cards.reduce((n, c) => n + (Number(c.deckleCount) || 0), 0);
+  const deckleDone = run ? run.done : 0;
+  // Rolls per Deckle are fixed by the knife layout (same widths, same cut
+  // count) regardless of which lot is on it, so any one pending card's
+  // plannedRolls stands in for a Deckle already slit and gone from `cards`.
+  const rollsPerDeckle = cards.length ? Number(cards[0].plannedRolls) || 0 : 0;
+  const pendingRollsMade = cards.reduce((n, c) => n + (Number(c.producedRolls) || 0), 0);
+  const rollsPlanned = run
+    ? deckleTotal * rollsPerDeckle
+    : cards.reduce((n, c) => n + (Number(c.plannedRolls) || 0), 0);
+  const rollsMade = run ? deckleDone * rollsPerDeckle + pendingRollsMade : pendingRollsMade;
+  // Usually one Product Code on a layout -- but a layout already up on the
+  // machine can take a second job under a different one (layoutRun.js's own
+  // worked example), so this is the set of codes actually in the group, not
+  // just cards[0]'s.
+  const productCodes = [...new Set(cards.map(c => c.productCode).filter(Boolean))];
   const curing = cards.filter(c => c.curing).length;
   const running = cards.some(c => c.running);
   return (
     <View style={[styles.jobCard, curing === cards.length ? styles.slittingCardCuring : styles.slittingCard]}>
       <View style={styles.jobHeaderRow}>
         <Text style={styles.groupLayout} numberOfLines={2}>
-          {group.layout.split(/\s*\|\s*/).map(l => l.split(/\s*\+\s*/).join(' - ')).join('   |   ')}
+          {formatLayout(group.layout)}
         </Text>
         <View style={styles.jobProductPill}>
-          <Text style={styles.jobProduct}>{cards.length} jobs</Text>
+          <Text style={styles.jobProduct} numberOfLines={1}>
+            {productCodes.join(', ')}
+          </Text>
         </View>
       </View>
-      <Text style={styles.jobLine}>
-        Deckles: <Text style={styles.jobLineValue}>{deckles}</Text>, done:{' '}
-        <Text style={styles.jobLineValue}>{done}</Text>, rolls to make:{' '}
-        <Text style={styles.jobLineValue}>{rollsToMake}</Text>
-      </Text>
+      {/* Two plain figures, side by side, label beside value -- what the
+          operator needs to decide whether to tap Start. */}
+      <View style={styles.statRow}>
+        <View style={styles.statItem}>
+          <Text style={styles.statLabel}>Deckle:</Text>
+          <Text style={styles.statValue}>{deckleDone}/{deckleTotal}</Text>
+        </View>
+        <View style={styles.statItem}>
+          <Text style={styles.statLabel}>Rolls:</Text>
+          <Text style={styles.statValue}>{rollsMade}/{rollsPlanned}</Text>
+        </View>
+      </View>
       {curing > 0 ? (
         <View style={styles.chipRow}>
           <View style={[styles.chip, { backgroundColor: colors.noticeBg, borderColor: colors.noticeBorder }]}>
@@ -275,10 +260,12 @@ function SlittingGroupCard({ group, onStart, note }) {
           </View>
         </View>
       ) : null}
-      {note ? <Text style={styles.groupNote}>{note}</Text> : null}
-      <TouchableOpacity onPress={() => onStart(group)} style={styles.startButton}>
-        <Text style={styles.startButtonText}>{running ? '▶ Resume' : '▶ Start · Select Job'}</Text>
-      </TouchableOpacity>
+      <View style={styles.actionRow}>
+        <ViewButton onPress={() => onView(cards.find(c => c.running) || cards[0])} label={group.layout} />
+        <TouchableOpacity onPress={() => onStart(group)} style={[styles.startButton, styles.actionGrow]}>
+          <Text style={styles.startButtonText}>{running ? '▶ Resume' : '▶ Start · Select Job'}</Text>
+        </TouchableOpacity>
+      </View>
     </View>
   );
 }
@@ -295,37 +282,42 @@ function SlittingGroupCard({ group, onStart, note }) {
 // run until its adhesive has cured, 6 h after lamination.
 function SlittingCard({ card, onOpen, onView }) {
   const left = card.deckleLeft;
-  const rollsToMake = card.plannedRolls - card.producedRolls;
+  // This card's Deckle counted through its knife layout's run, not on its
+  // own: Deckles done out of the run's whole total, matching the group tile
+  // above (the run's own position is what the "Select Job" picker shows,
+  // since picking a Deckle needs to say which one, not how many are done).
+  const run = runOf(card);
+  const rollsPerDeckle = Number(card.plannedRolls) || 0;
+  const rollsPlanned = run ? run.total * rollsPerDeckle : card.plannedRolls;
+  const rollsMade = run ? run.done * rollsPerDeckle + (Number(card.producedRolls) || 0) : card.producedRolls;
   return (
     <View
       style={[
         styles.jobCard,
         card.curing ? styles.slittingCardCuring : styles.slittingCard,
       ]}>
+      {/* Same top row as the group tile, in the same order: the layout
+          leads, the product pill trails -- Start opens the very same Select
+          Job dialog either way now, so the tile that leads to it reads the
+          same too. Lot and id live in that dialog, not here. */}
       <View style={styles.jobHeaderRow}>
-        {/* Lot leads, with the card's own slitting-job id as a quiet caption
-            beneath it -- the same primary/secondary identity block a lamination
-            tile leads with, rather than the id dangling on its own line under
-            the header. */}
-        <View style={styles.jobHeaderLeft}>
-          <View style={styles.slittingIdentity}>
-            <Text style={styles.jobLot} numberOfLines={1}>
-              {card.lotNo}
-            </Text>
-            <Text style={styles.slittingCardId} numberOfLines={1}>
-              {card.slittingJobCardId}
-            </Text>
-          </View>
-        </View>
+        <Text style={styles.groupLayout} numberOfLines={2}>
+          {formatLayout(layoutKeyOf(card))}
+        </Text>
         <View style={styles.jobProductPill}>
           <Text style={styles.jobProduct}>{card.productCode}</Text>
         </View>
       </View>
-      <Text style={styles.jobLine}>
-        Deckles: <Text style={styles.jobLineValue}>{card.deckleCount}</Text>, done:{' '}
-        <Text style={styles.jobLineValue}>{card.deckleDone}</Text>, rolls to make:{' '}
-        <Text style={styles.jobLineValue}>{rollsToMake}</Text>
-      </Text>
+      <View style={styles.statRow}>
+        <View style={styles.statItem}>
+          <Text style={styles.statLabel}>Deckle:</Text>
+          <Text style={styles.statValue}>{run ? `${run.done}/${run.total}` : `${left}/${card.deckleCount}`}</Text>
+        </View>
+        <View style={styles.statItem}>
+          <Text style={styles.statLabel}>Rolls:</Text>
+          <Text style={styles.statValue}>{rollsMade}/{rollsPlanned}</Text>
+        </View>
+      </View>
 
       {/* Curing is the one gate on running this card, so it is the one thing
           that gets a chip: notice amber while a Deckle is still curing. Once
@@ -345,18 +337,19 @@ function SlittingCard({ card, onOpen, onView }) {
           Job Setting: only the Deckle's own Start is gated, and the card
           itself says so. */}
       <View style={styles.actionRow}>
-        <ViewButton onPress={() => onView(card)} label={card.lotNo} />
+        <ViewButton onPress={() => onView(card)} label={layoutKeyOf(card)} />
         <TouchableOpacity onPress={() => onOpen(card)} style={[styles.startButton, styles.actionGrow]}>
-          <Text style={styles.startButtonText}>
-            {card.running ? '▶ Resume' : card.deckleDone > 0 ? `▶ Continue · ${left} left` : '▶ Start'}
-          </Text>
+          {/* Same label the group tile's Start carries -- Start always means
+              "open the Select Job dialog", whether it ends up holding one
+              job or several, so it always says so the same way. */}
+          <Text style={styles.startButtonText}>{card.running ? '▶ Resume' : '▶ Start · Select Job'}</Text>
         </TouchableOpacity>
       </View>
     </View>
   );
 }
 
-export default function QueueScreen({ navigation, onLoggedOut, scannedCode, onScanHandled }) {
+export default function QueueScreen({ navigation, onLoggedOut }) {
   const [queue, setQueue] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
@@ -369,10 +362,6 @@ export default function QueueScreen({ navigation, onLoggedOut, scannedCode, onSc
   // dialog shows it. null while no dialog is open.
   const [viewing, setViewing] = useState(null);
   const offline = useOffline();
-  // The group whose Start opened the scanner, and what to tell the operator
-  // when the scan was not a Deckle of it.
-  const scanGroupRef = useRef(null);
-  const [groupNote, setGroupNote] = useState(null);
 
   // The group whose Deckle picker is open, or null.
   const [pickGroup, setPickGroup] = useState(null);
@@ -383,45 +372,15 @@ export default function QueueScreen({ navigation, onLoggedOut, scannedCode, onSc
       navigation.navigate('SlittingJobCard', { cardId: live._id });
       return;
     }
-    setGroupNote(null);
     setPickGroup(group);
   };
 
   // A Deckle picked in the dialog opens its job with that Deckle handed over to
-  // be confirmed -- the same hand-off a scan makes below.
+  // be confirmed.
   const selectDeckle = ({ card, deckleId }) => {
     setPickGroup(null);
     navigation.navigate('SlittingJobCard', { cardId: card._id, armDeckle: deckleId });
   };
-
-  const scanForGroup = () => {
-    const group = pickGroup;
-    setPickGroup(null);
-    if (!group) {
-      return;
-    }
-    scanGroupRef.current = group;
-    navigation.navigate('Scan', { returnTo: 'Home' });
-  };
-
-  // The scan comes back to Home as a param. Find its job inside the group that
-  // asked and open it with that Deckle handed over to be confirmed.
-  useEffect(() => {
-    const group = scanGroupRef.current;
-    if (!scannedCode || !group) {
-      return;
-    }
-    scanGroupRef.current = null;
-    onScanHandled && onScanHandled();
-    const hit = findScannedDeckle(group.cards, scannedCode);
-    if (!hit) {
-      setGroupNote({ key: group.key, message: "That Deckle isn't in this group — scan one of its Deckles." });
-    } else if (hit.done) {
-      setGroupNote({ key: group.key, message: 'That Deckle has already been slit.' });
-    } else {
-      navigation.navigate('SlittingJobCard', { cardId: hit.card._id, armDeckle: scannedCode });
-    }
-  }, [scannedCode, onScanHandled, navigation]);
 
   const load = useCallback(async () => {
     try {
@@ -536,7 +495,7 @@ export default function QueueScreen({ navigation, onLoggedOut, scannedCode, onSc
                           key={group.key}
                           group={group}
                           onStart={startGroup}
-                          note={groupNote?.key === group.key ? groupNote.message : null}
+                          onView={selected => setViewing({ kind: 'slitting', row: selected })}
                         />
                       );
                     }
@@ -545,7 +504,13 @@ export default function QueueScreen({ navigation, onLoggedOut, scannedCode, onSc
                       <SlittingCard
                         key={sCard._id}
                         card={sCard}
-                        onOpen={selected => navigation.navigate('SlittingJobCard', { cardId: selected._id })}
+                        // Start goes through the very same Select Job dialog a
+                        // multi-card group opens, with its one job as the only
+                        // entry -- a lone Deckle job never skips straight into
+                        // the job card while a bundled one stops at a picker
+                        // first; one flow either way, so Start always means
+                        // the same thing to the operator.
+                        onOpen={() => startGroup(group)}
                         onView={selected => setViewing({ kind: 'slitting', row: selected })}
                       />
                     );
@@ -596,7 +561,6 @@ export default function QueueScreen({ navigation, onLoggedOut, scannedCode, onSc
         visible={!!pickGroup}
         group={pickGroup}
         onSelect={selectDeckle}
-        onScan={scanForGroup}
         onCancel={() => setPickGroup(null)}
       />
     </View>
@@ -703,16 +667,24 @@ const styles = StyleSheet.create({
   // green a fully-allotted lamination tile takes once it has cured and is
   // ready to run.
   groupLayout: { flex: 1, fontSize: 18, fontWeight: '800', color: colors.primary, fontFamily },
-  groupNote: { fontSize: 12.5, fontWeight: '600', color: colors.dangerStrong, marginBottom: spacing.sm, fontFamily },
   slittingCard: { backgroundColor: colors.rowMatchBg },
   slittingCardCuring: { backgroundColor: colors.noticeBg, borderColor: colors.noticeBorder },
-  // The lot + id identity block in the header-left. Stacked (column) so the id
-  // sits as a caption directly under the lot; flexShrink lets a long lot
-  // ellipsise rather than shoving the product pill off the card.
-  slittingIdentity: { flexShrink: 1 },
-  slittingCardId: { fontSize: 11, fontWeight: '600', color: colors.textMuted, marginTop: 1, fontFamily },
   jobLine: { fontSize: 12.5, color: colors.textDark, marginBottom: 2, fontFamily },
   jobLineValue: { fontWeight: '700' },
+  // Two plain figures, label beside value on one line -- the slitting tiles'
+  // Deckle and Rolls counts, read at a glance instead of a comma-packed
+  // sentence.
+  statRow: { flexDirection: 'row', gap: spacing.lg, marginBottom: spacing.xs },
+  statItem: { flexDirection: 'row', alignItems: 'baseline', gap: 4 },
+  statLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+    letterSpacing: 0.2,
+    textTransform: 'uppercase',
+    color: colors.textMuted,
+    fontFamily,
+  },
+  statValue: { fontSize: 15, fontWeight: '800', color: colors.textDark, fontFamily },
   chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 4, marginBottom: spacing.sm },
   chip: {
     borderRadius: radii.pill,

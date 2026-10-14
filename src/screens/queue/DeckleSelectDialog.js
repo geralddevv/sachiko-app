@@ -3,19 +3,18 @@ import { View, Text, Modal, TouchableOpacity, ScrollView, StyleSheet } from 'rea
 import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
 import { colors, radii, spacing, fontFamily } from '../../theme/theme';
 import Button from '../../theme/Button';
+import { runOf, formatLayout } from './layoutRun';
 
 // "Select Job": opened by the Start button of a same-layout group tile on the Work Queue. The
 // group's jobs are listed with the Deckles still to slit in each; the operator
 // picks the one going on the machine and carries on. Choosing hands that Deckle
 // to its job card exactly as a scan of it would (the card confirms it on load),
-// so nothing changes on the job card itself -- and "Scan Deckle instead" keeps the
-// original way in, reading the physical reel.
+// so nothing changes on the job card itself.
 //
 // `group.cards[]` are the queue's slitting cards; each has `deckles: [{ id, done }]`.
 // A job is picked as a whole: its next Deckle still to slit is the one handed over,
-// and the job card lists the rest. `onSelect({ card, deckleId })` / `onScan()` /
-// `onCancel()`.
-export default function DeckleSelectDialog({ visible, group, onSelect, onScan, onCancel }) {
+// and the job card lists the rest. `onSelect({ card, deckleId })` / `onCancel()`.
+export default function DeckleSelectDialog({ visible, group, onSelect, onCancel }) {
   const [selectedId, setSelectedId] = useState(null); // a card's _id
 
   // A fresh choice each time the dialog opens.
@@ -25,8 +24,10 @@ export default function DeckleSelectDialog({ visible, group, onSelect, onScan, o
     }
   }, [visible, group]);
 
+  // Already in run order: groupSlittingByLayout sorts a group's cards by their
+  // Deckle's place in the layout's run, so the list reads 3, 4, 5 ... down the
+  // page. Only jobs that still have a Deckle to run are offered.
   const cards = group ? group.cards : [];
-  // Only jobs that still have a Deckle to run.
   const open = cards
     .map(card => ({ card, pending: (card.deckles || []).filter(d => d && d.id && !d.done) }))
     .filter(entry => entry.pending.length > 0);
@@ -51,7 +52,7 @@ export default function DeckleSelectDialog({ visible, group, onSelect, onScan, o
             <Text style={styles.title}>Select Job</Text>
             {group ? (
               <Text style={styles.layout} numberOfLines={2} adjustsFontSizeToFit minimumFontScale={0.6}>
-                {group.layout.split(/\s*\|\s*/).map(l => l.split(/\s*\+\s*/).join(' - ')).join('   |   ')}
+                {formatLayout(group.layout)}
               </Text>
             ) : null}
           </View>
@@ -67,6 +68,12 @@ export default function DeckleSelectDialog({ visible, group, onSelect, onScan, o
             ) : null}
             {open.map(({ card, pending }) => {
               const active = selectedId === card._id;
+              // This Deckle's place in its knife layout's run -- the number the
+              // office's machine queue shows against the same Deckle. Just the
+              // position, not a "x of y" fraction -- the run's total adds
+              // nothing an operator picking one job out of a short list needs.
+              const run = runOf(card);
+              const no = run ? (run.from === run.to ? String(run.from) : `${run.from}–${run.to}`) : '';
               return (
                 <TouchableOpacity
                   key={card._id}
@@ -74,16 +81,24 @@ export default function DeckleSelectDialog({ visible, group, onSelect, onScan, o
                   onPress={() => setSelectedId(card._id)}
                   accessibilityRole="button"
                   accessibilityState={{ selected: active }}
-                  accessibilityLabel={`Job ${card.lotNo}, ${pending.length} Deckle${pending.length === 1 ? '' : 's'} left`}
+                  accessibilityLabel={
+                    no
+                      ? `Job ${card.lotNo}, Deckle ${no} on this layout`
+                      : `Job ${card.lotNo}, ${pending.length} Deckle${pending.length === 1 ? '' : 's'} left`
+                  }
                   style={[styles.job, active && styles.jobActive]}>
                   <View style={styles.jobHead}>
+                    {run ? (
+                      <View style={[styles.deckleNo, active && styles.deckleNoActive]}>
+                        <Text style={styles.deckleNoNum}>{no}</Text>
+                      </View>
+                    ) : null}
                     <View style={styles.jobHeadText}>
                       <Text style={styles.jobLot} numberOfLines={1}>
                         {card.lotNo}
                       </Text>
                       <Text style={styles.jobId} numberOfLines={1}>
                         {card.slittingJobCardId}
-                        {pending.length > 1 ? ` · ${pending.length} Deckles left` : ''}
                       </Text>
                     </View>
                     <View style={styles.pill}>
@@ -108,7 +123,6 @@ export default function DeckleSelectDialog({ visible, group, onSelect, onScan, o
             </TouchableOpacity>
             <Button title="Continue" icon="play" variant="success" onPress={submit} disabled={!chosen} style={styles.button} />
           </View>
-          <Button title="Scan Deckle instead" icon="qrcode-scan" variant="outline" onPress={onScan} style={styles.scanButton} />
           </View>
         </View>
       </View>
@@ -181,6 +195,21 @@ const styles = StyleSheet.create({
   },
   jobActive: { borderColor: colors.primary, borderWidth: 2, backgroundColor: colors.infoPanelBg },
   jobHead: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, paddingHorizontal: spacing.xs },
+  // The Deckle's number in the layout's run, leading the row -- it is how the
+  // operator and the office refer to the same Deckle.
+  deckleNo: {
+    minWidth: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 6,
+    paddingHorizontal: spacing.xs,
+    borderRadius: radii.sm,
+    backgroundColor: colors.infoPanelBg,
+    borderWidth: 1,
+    borderColor: colors.borderLight,
+  },
+  deckleNoActive: { borderColor: colors.primary },
+  deckleNoNum: { fontSize: 15, fontWeight: '800', color: colors.primary, fontFamily },
   jobHeadText: { flex: 1 },
   jobLot: { fontSize: 14, fontWeight: '800', color: colors.textDark, fontFamily },
   jobId: { fontSize: 11.5, fontWeight: '600', color: colors.textMuted, fontFamily },
@@ -204,5 +233,4 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   cancelButtonText: { color: '#FFFFFF', fontSize: 13, fontWeight: '700', fontFamily },
-  scanButton: { marginTop: spacing.sm },
 });
